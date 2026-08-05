@@ -1,0 +1,2467 @@
+#!/usr/bin/env python3
+"""
+omsid_checker.py -- Home Depot OMSID to live URL checker (single file)
+======================================================================
+
+Reads an Excel file of Home Depot OMSIDs (Internet #), checks each one against
+HomeDepot.com, and writes an Excel workbook containing the live product URL or
+"N/A".
+
+HOW TO USE
+----------
+    1. pip install pandas openpyxl requests
+    2. Put this file and your OMSID workbook in the SAME folder.
+    3. Edit the SETTINGS block immediately below.
+    4. Run this file (in PyCharm: right-click the editor -> Run,
+       or press Ctrl+Shift+F10).
+
+    Start with MODE = "validate". Only move on if it reports LIVE.
+
+STATUS VALUES IN THE OUTPUT
+---------------------------
+    LIVE       Item resolved to a live product page; URL populated.
+    NOT_FOUND  Site answered cleanly, no such item.  -> URL is "N/A"
+    BLOCKED    Bot management intercepted the request. NOT a dead item.
+    ERROR      Network or parse failure. NOT a dead item.
+    INVALID    That input row contained no usable OMSID.
+
+A block is never recorded as "N/A", so a throttled run cannot silently mark
+live items as dead. Re-run with the same cache file to retry only the
+unresolved rows.
+"""
+
+# ===========================================================================
+#  SETTINGS -- these are the only lines you need to edit.
+# ===========================================================================
+
+# "network"  -> report this machine's public IP and whether a VPN/proxy is in use
+# "probe"    -> test which Home Depot URL patterns actually respond
+# "sitemap_test" -> check whether Home Depot's XML sitemaps are reachable
+# "sitemap"      -> build an OMSID->URL index from sitemaps, then match your file
+# "audit"        -> full crawl with statistics; tells you whether a missing
+#                   OMSID means an incomplete crawl or a genuine sitemap gap
+# "validate" -> connection test only, checks the OMSIDs in VALIDATION_OMSIDS
+# "test"     -> real run, but only the first TEST_LIMIT OMSIDs
+# "full"     -> real run, entire input file
+MODE = "sitemap"
+
+INPUT_FILE = "Book11.xlsx"        # your OMSID workbook (same folder as this file)
+OUTPUT_FILE = "results.xlsx"      # workbook this script will create
+
+SHEET_NAME = None                 # None = first sheet, or e.g. "Sheet1"
+OMSID_COLUMN = None               # None = auto-detect, or e.g. "OMSID"
+
+# PROBE MODE ONLY. Paste one full Home Depot product URL that you have just
+# confirmed loads in your browser, e.g.
+#   "https://www.homedepot.com/p/Some-Product-Name-ABC123/206856244"
+# Probe mode uses this as a control to tell "the site blocks me" apart from
+# "my URL patterns are wrong".
+KNOWN_GOOD_URL = (
+    "https://www.homedepot.com/p/Hollywood-Bed-Frame-Atlas-Lock-Black-Adjustable-Metal-Bed-Frame-w-Glides-Twin-Full-4-Leg-3150BSG-I/206856244"
+)
+
+# Used by validate and probe modes. Put your own live OMSIDs here.
+# Add two of your own that you have confirmed load on the site right now.
+VALIDATION_OMSIDS = ["206856244", "206856234"]
+
+# Home Depot's product resolver expects a store context. Any valid store
+# number works; 121 is a long-standing store used in the site's own examples.
+STORE_ID = "121"
+ZIP_CODE = "30301"
+
+# ENGINE selects how pages are fetched.
+#   "playwright" -> drives a real Chromium browser. Executes the JavaScript
+#                   that generates Akamai's sensor cookie, which is what
+#                   product pages require. Slower, but it works.
+#   "http"       -> plain HTTP via requests/curl_cffi. Fast, but Home Depot
+#                   returns 403 on product pages for this.
+# Setup for playwright, run once in the PyCharm Terminal tab:
+#     pip install playwright
+#     playwright install chromium
+ENGINE = "playwright"
+
+# False shows the browser window. Leave it False at first -- a visible browser
+# is both easier to debug and less likely to be flagged than a headless one.
+HEADLESS = False
+
+# Sitemap settings. The index is cached on disk, so the slow build happens
+# once and later runs are instant.
+SITEMAP_INDEX_FILE = "homedepot_sitemap_index.json"
+SITEMAP_MAX_FILES = 1000           # cap on product sitemap files to download
+SITEMAP_REBUILD = True           # True forces a fresh download
+
+# True indexes only the OMSIDs in your input file and stops as soon as all of
+# them are found -- far faster and smaller. False indexes Home Depot's entire
+# catalog (~4.2 million products), which takes much longer and a lot of disk.
+SITEMAP_FILTER_TO_INPUT = True
+
+# Used by MODE = "audit". Put the OMSIDs you want investigated here.
+AUDIT_OMSIDS = ["343542969"]
+
+PAGE_TIMEOUT_MS = 30000           # per-page navigation timeout
+PAGE_SETTLE_MS = 1200             # pause after load for redirects to finish
+
+# Akamai fingerprints the TLS handshake, and the plain "requests" library has
+# a fingerprint no real browser produces. curl_cffi replays Chrome's actual
+# handshake and is usually what gets past that check.
+#     pip install curl_cffi
+USE_CURL_CFFI = True
+IMPERSONATE = "chrome"            # e.g. "chrome", "chrome124", "safari17_0"
+
+# Set True to write the raw API response for the first few requests to
+# debug_response.txt. Useful when results look wrong.
+DEBUG_DUMP = False
+
+TEST_LIMIT = 25                   # how many OMSIDs "test" mode checks
+WORKERS = 3                       # concurrent requests -- keep this low
+DELAY_SECONDS = 1.0               # pause before each request
+PROXY = None                      # e.g. "http://user:pass@host:port"
+CACHE_FILE = "run_cache.json"     # enables resume; set to None to disable
+
+# ===========================================================================
+#  Nothing below this line needs editing.
+# ===========================================================================
+
+
+import argparse
+import gzip
+import io
+import xml.etree.ElementTree as ET
+import json
+import random
+import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import pandas as pd
+    import requests
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+except ImportError as exc:  # pragma: no cover
+    sys.exit(
+        f"Missing dependency: {exc.name}\n"
+        "Install with:  pip install pandas openpyxl requests"
+    )
+
+# curl_cffi is optional. Without it the script falls back to plain requests,
+# which Akamai detects by TLS fingerprint regardless of how good the IP is.
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+    HTTP_ERRORS = (requests.RequestException, curl_requests.RequestsError)
+except ImportError:
+    curl_requests = None
+    CURL_CFFI_AVAILABLE = False
+    HTTP_ERRORS = (requests.RequestException,)
+
+
+# ---------------------------------------------------------------------------
+# Constants -- this block is the maintenance surface. If Home Depot changes its
+# internal API, the edits you need are almost certainly in here.
+# ---------------------------------------------------------------------------
+
+BASE_URL = "https://www.homedepot.com"
+GRAPHQL_URL = f"{BASE_URL}/federation-gateway/graphql"
+GRAPHQL_OPNAME = "productClientOnlyProduct"
+
+# Home Depot's product resolver has changed argument shape over time, and a
+# missing argument yields a null product rather than an error. So several
+# variants are defined and tried in order. The first one that returns a real
+# product is remembered and used for the rest of the run, so this costs extra
+# requests only during warm-up.
+
+_FIELDS = """
+    itemId
+    identifiers {
+      canonicalUrl
+      brandName
+      productLabel
+      modelNumber
+      storeSkuNumber
+    }
+"""
+
+QUERY_VARIANTS = [
+    (
+        "store_and_datasource",
+        """query productClientOnlyProduct($itemId: String!, $storeId: String, $zipCode: String, $dataSource: String) {
+  product(itemId: $itemId, dataSource: $dataSource) {""" + _FIELDS + """  }
+}""",
+        lambda omsid: {
+            "itemId": omsid,
+            "storeId": STORE_ID,
+            "zipCode": ZIP_CODE,
+            "dataSource": "catalog",
+        },
+    ),
+    (
+        "store_only",
+        """query productClientOnlyProduct($itemId: String!, $storeId: String, $zipCode: String) {
+  product(itemId: $itemId) {""" + _FIELDS + """  }
+}""",
+        lambda omsid: {
+            "itemId": omsid,
+            "storeId": STORE_ID,
+            "zipCode": ZIP_CODE,
+        },
+    ),
+    (
+        "item_only",
+        """query productClientOnlyProduct($itemId: String!) {
+  product(itemId: $itemId) {""" + _FIELDS + """  }
+}""",
+        lambda omsid: {"itemId": omsid},
+    ),
+]
+
+# Index of the variant known to work. Set by the first successful lookup.
+_PREFERRED_VARIANT: Optional[int] = None
+_VARIANT_LOCK = threading.Lock()
+_DEBUG_WRITES = 0
+
+# Tried in order by the REDIRECT method. First one that lands on a PDP wins.
+REDIRECT_TEMPLATES = (
+    "https://www.homedepot.com/p/x/{omsid}",
+    "https://www.homedepot.com/s/{omsid}",
+)
+
+# Matches a canonical product-detail-page path and captures the trailing item id.
+PDP_PATH_RE = re.compile(r"/p/(?:[^/?#]+/)*(\d{6,})(?:[/?#]|$)")
+
+USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+)
+
+# Header names that commonly appear above an OMSID column, lowercased.
+CANDIDATE_HEADERS = (
+    "omsid",
+    "oms id",
+    "oms_id",
+    "internet",
+    "internet #",
+    "internet number",
+    "internet_number",
+    "item id",
+    "itemid",
+    "item_id",
+    "thd sku",
+    "home depot sku",
+    "homedepot sku",
+    "merchant sku",
+)
+
+# Status vocabulary.
+STATUS_LIVE = "LIVE"            # Item resolved to a PDP URL.
+STATUS_NOT_FOUND = "NOT_FOUND"  # Site answered cleanly; no such product. -> N/A
+STATUS_BLOCKED = "BLOCKED"      # Bot management intercepted. Retry needed.
+STATUS_ERROR = "ERROR"          # Network / parse failure. Retry needed.
+STATUS_INVALID = "INVALID"      # Input cell held no usable OMSID.
+
+TERMINAL_STATUSES = frozenset({STATUS_LIVE, STATUS_NOT_FOUND})
+NOT_APPLICABLE = "N/A"
+
+
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LookupResult:
+    omsid: str
+    status: str = STATUS_ERROR
+    url: str = NOT_APPLICABLE
+    product_name: str = ""
+    brand: str = ""
+    model_number: str = ""
+    store_sku: str = ""
+    method: str = ""
+    http_status: Optional[int] = None
+    attempts: int = 0
+    checked_utc: str = ""
+    note: str = ""
+
+    def stamp(self) -> "LookupResult":
+        self.checked_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Input handling
+# ---------------------------------------------------------------------------
+
+
+def normalize_omsid(raw: Any) -> Optional[str]:
+    """
+    Coerce a spreadsheet cell into a bare digit string.
+
+    Handles the usual Excel indignities: numeric columns read back as floats
+    ("205220341.0"), stray whitespace, leading apostrophes, and NaN.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, float):
+        if pd.isna(raw):
+            return None
+        if float(raw).is_integer():
+            raw = int(raw)
+    text = str(raw).strip()
+    if not text or text.lower() in {"nan", "none", "n/a", "na", "-", "null"}:
+        return None
+    text = re.sub(r"\.0+$", "", text)
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return None
+    # Home Depot Internet numbers are 9 digits, but do not hard-fail on length;
+    # flag it in the note instead so nothing is silently dropped.
+    return digits
+
+
+def detect_omsid_column(df: "pd.DataFrame") -> str:
+    """
+    Find the OMSID column by header name, then by content shape as a fallback.
+    """
+    lowered = {str(col).strip().lower(): col for col in df.columns}
+
+    for candidate in CANDIDATE_HEADERS:
+        if candidate in lowered:
+            return lowered[candidate]
+
+    for key, col in lowered.items():
+        if any(candidate in key for candidate in CANDIDATE_HEADERS):
+            return col
+
+    # Content-based fallback: the column with the highest share of values that
+    # normalize to 8-10 digit numbers.
+    best_col, best_score = None, 0.0
+    for col in df.columns:
+        series = df[col].head(200)
+        if series.empty:
+            continue
+        hits = sum(
+            1
+            for value in series
+            if (norm := normalize_omsid(value)) and 8 <= len(norm) <= 10
+        )
+        score = hits / len(series)
+        if score > best_score:
+            best_col, best_score = col, score
+
+    if best_col is not None and best_score >= 0.5:
+        return best_col
+
+    raise ValueError(
+        "Could not identify an OMSID column. Pass one explicitly with --column. "
+        f"Columns present: {list(df.columns)}"
+    )
+
+
+def load_input(
+    path: Path, sheet: Optional[str], column: Optional[str]
+) -> Tuple["pd.DataFrame", str]:
+    """
+    Read the workbook and return (dataframe, omsid_column_name).
+
+    The full input is preserved, including duplicate OMSIDs and non-OMSID
+    columns, so the output workbook is a superset of what you handed in.
+    """
+    sheet_arg: Any = 0 if sheet is None else sheet
+    df = pd.read_excel(path, sheet_name=sheet_arg, dtype=object)
+
+    if isinstance(df, dict):  # pandas returns a dict when sheet_name is None
+        first_key = next(iter(df))
+        df = df[first_key]
+
+    if df.empty:
+        raise ValueError(f"No rows found in {path} (sheet={sheet_arg!r}).")
+
+    if column:
+        if column not in df.columns:
+            raise ValueError(
+                f"Column {column!r} not present. Columns: {list(df.columns)}"
+            )
+        omsid_col = column
+    else:
+        omsid_col = detect_omsid_column(df)
+
+    df = df.copy()
+    # Build as a pure-Python object Series. Using .map() here would let pandas
+    # coerce every None into NaN, and NaN is truthy -- an invalid row would then
+    # be treated as a real OMSID downstream.
+    df["_omsid_norm"] = pd.Series(
+        [normalize_omsid(value) for value in df[omsid_col]],
+        index=df.index,
+        dtype=object,
+    )
+    return df, omsid_col
+
+
+# ---------------------------------------------------------------------------
+# HTTP session management
+# ---------------------------------------------------------------------------
+
+
+class SessionPool:
+    """
+    One requests.Session per worker thread, each with its own cookie jar and
+    user agent. Cookies matter: the gateway rejects requests that have not
+    first been through the site and picked up an Akamai session.
+    """
+
+    def __init__(self, proxy: Optional[str], timeout: float, verbose: bool = False):
+        self._local = threading.local()
+        self._proxy = proxy
+        self._timeout = timeout
+        self._verbose = verbose
+
+    @property
+    def session(self):
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._build()
+            self._local.session = session
+        return session
+
+    def _build(self):
+        use_cffi = USE_CURL_CFFI and CURL_CFFI_AVAILABLE
+        proxies = (
+            {"http": self._proxy, "https": self._proxy} if self._proxy else None
+        )
+
+        if use_cffi:
+            kwargs = {"impersonate": IMPERSONATE}
+            if proxies:
+                kwargs["proxies"] = proxies
+            session = curl_requests.Session(**kwargs)
+            # curl_cffi supplies its own browser-consistent user-agent and
+            # header ordering; overriding those defeats the impersonation.
+        else:
+            session = requests.Session()
+            session.headers.update(
+                {
+                    "user-agent": random.choice(USER_AGENTS),
+                    "accept-language": "en-US,en;q=0.9",
+                    "accept-encoding": "gzip, deflate, br",
+                }
+            )
+            if proxies:
+                session.proxies.update(proxies)
+
+        self._warm(session)
+        return session
+
+    def _warm(self, session) -> None:
+        """Acquire cookies by loading the homepage before touching the API."""
+        try:
+            response = session.get(
+                f"{BASE_URL}/",
+                headers=html_headers(),
+                timeout=self._timeout,
+                allow_redirects=True,
+            )
+            if self._verbose:
+                print(
+                    f"    [warm] homepage -> HTTP {response.status_code}, "
+                    f"{len(session.cookies)} cookies",
+                    file=sys.stderr,
+                )
+        except HTTP_ERRORS as exc:
+            if self._verbose:
+                print(f"    [warm] failed: {exc}", file=sys.stderr)
+
+    def reset(self) -> None:
+        """Discard this thread's session after a block and build a fresh one."""
+        session = getattr(self._local, "session", None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        self._local.session = None
+
+
+def html_headers() -> Dict[str, str]:
+    return {
+        "accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
+    }
+
+
+def graphql_headers() -> Dict[str, str]:
+    return {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": BASE_URL,
+        "referer": f"{BASE_URL}/",
+        "apollographql-client-name": "general-merchandise",
+        "apollographql-client-version": "0.0.0",
+        "x-experience-name": "general-merchandise",
+        "x-hd-dc": "origin",
+        "x-current-url": "/",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+
+
+def looks_blocked(response: "requests.Response") -> bool:
+    if response.status_code in (401, 403, 429):
+        return True
+    if response.status_code == 200:
+        head = response.text[:2000].lower()
+        for marker in ("access denied", "reference #", "pardon our interruption",
+                       "bot detection", "_abck"):
+            if marker in head and "<html" in head:
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Lookup methods
+# ---------------------------------------------------------------------------
+
+
+def absolutize(url: str) -> str:
+    if not url:
+        return ""
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if not url.startswith("/"):
+        url = "/" + url
+    return BASE_URL + url
+
+
+def _dump_debug(label: str, response: "requests.Response") -> None:
+    """Append a raw response to debug_response.txt when DEBUG_DUMP is on."""
+    global _DEBUG_WRITES
+    if not DEBUG_DUMP or _DEBUG_WRITES >= 8:
+        return
+    with _VARIANT_LOCK:
+        if _DEBUG_WRITES >= 8:
+            return
+        _DEBUG_WRITES += 1
+        try:
+            with open("debug_response.txt", "a", encoding="utf-8") as handle:
+                handle.write("=" * 70 + "\n")
+                handle.write(f"{label}\nHTTP {response.status_code}\n")
+                handle.write(f"content-type: {response.headers.get('content-type')}\n")
+                handle.write("-" * 70 + "\n")
+                handle.write(response.text[:4000] + "\n\n")
+        except OSError:
+            pass
+
+
+def _graphql_attempt(
+    session: "requests.Session", omsid: str, timeout: float, variant_index: int
+) -> Tuple[LookupResult, bool]:
+    """
+    Run one query variant.
+
+    Returns (result, definitive). "definitive" is False only when the response
+    was clean but the product came back null, which is the ambiguous case that
+    justifies trying another variant.
+    """
+    name, query, build_vars = QUERY_VARIANTS[variant_index]
+    result = LookupResult(omsid=omsid, method=f"GRAPHQL[{name}]")
+    payload = {
+        "operationName": GRAPHQL_OPNAME,
+        "variables": build_vars(omsid),
+        "query": query,
+    }
+    try:
+        response = session.post(
+            GRAPHQL_URL,
+            params={"opname": GRAPHQL_OPNAME},
+            json=payload,
+            headers=graphql_headers(),
+            timeout=timeout,
+        )
+    except HTTP_ERRORS as exc:
+        result.status = STATUS_ERROR
+        result.note = f"request failed: {type(exc).__name__}: {exc}"
+        return result, True
+
+    result.http_status = response.status_code
+    _dump_debug(f"{omsid} variant={name}", response)
+
+    if looks_blocked(response):
+        result.status = STATUS_BLOCKED
+        result.note = f"bot management response (HTTP {response.status_code})"
+        return result, True
+
+    if response.status_code >= 500:
+        result.status = STATUS_ERROR
+        result.note = f"server error HTTP {response.status_code}"
+        return result, True
+
+    try:
+        body = response.json()
+    except ValueError:
+        result.status = STATUS_ERROR
+        result.note = f"response was not JSON (HTTP {response.status_code})"
+        return result, True
+
+    if body.get("errors"):
+        messages = "; ".join(
+            str(err.get("message", err))[:160] for err in body["errors"][:3]
+        )
+        result.status = STATUS_ERROR
+        result.note = f"graphql errors: {messages}"
+        # A schema rejection is definitive for THIS variant but not for others.
+        return result, False
+
+    product = (body.get("data") or {}).get("product")
+    if not product:
+        result.status = STATUS_NOT_FOUND
+        result.note = f"null product (variant={name})"
+        return result, False
+
+    identifiers = product.get("identifiers") or {}
+    canonical = absolutize(identifiers.get("canonicalUrl") or "")
+    if not canonical:
+        canonical = f"{BASE_URL}/p/x/{omsid}"
+        result.note = "canonicalUrl absent; URL rebuilt from itemId"
+
+    result.status = STATUS_LIVE
+    result.url = canonical
+    result.product_name = identifiers.get("productLabel") or ""
+    result.brand = identifiers.get("brandName") or ""
+    result.model_number = identifiers.get("modelNumber") or ""
+    result.store_sku = identifiers.get("storeSkuNumber") or ""
+    return result, True
+
+
+def graphql_lookup(
+    session: "requests.Session", omsid: str, timeout: float
+) -> LookupResult:
+    """
+    Try query variants until one gives a definitive answer. Once a variant
+    returns a live product, it is remembered and tried first from then on.
+    """
+    global _PREFERRED_VARIANT
+
+    order = list(range(len(QUERY_VARIANTS)))
+    if _PREFERRED_VARIANT is not None:
+        order.remove(_PREFERRED_VARIANT)
+        order.insert(0, _PREFERRED_VARIANT)
+        # A known-good variant is trusted; do not spend requests on the rest.
+        order = order[:1]
+
+    last = LookupResult(omsid=omsid, method="GRAPHQL", status=STATUS_ERROR,
+                        note="no variant attempted")
+
+    for index in order:
+        result, definitive = _graphql_attempt(session, omsid, timeout, index)
+        last = result
+
+        if result.status == STATUS_LIVE:
+            if _PREFERRED_VARIANT is None:
+                with _VARIANT_LOCK:
+                    if _PREFERRED_VARIANT is None:
+                        _PREFERRED_VARIANT = index
+                        print(
+                            f"    [info] using GraphQL variant "
+                            f"'{QUERY_VARIANTS[index][0]}' for this run",
+                            file=sys.stderr,
+                        )
+            return result
+
+        if definitive:
+            return result
+
+    return last
+
+
+def redirect_lookup(
+    session: "requests.Session", omsid: str, timeout: float
+) -> LookupResult:
+    result = LookupResult(omsid=omsid, method="REDIRECT")
+    last_note = ""
+
+    for template in REDIRECT_TEMPLATES:
+        probe_url = template.format(omsid=omsid)
+        try:
+            response = session.get(
+                probe_url,
+                headers=html_headers(),
+                timeout=timeout,
+                allow_redirects=True,
+            )
+        except HTTP_ERRORS as exc:
+            last_note = f"request failed: {type(exc).__name__}: {exc}"
+            continue
+
+        result.http_status = response.status_code
+
+        if looks_blocked(response):
+            result.status = STATUS_BLOCKED
+            result.note = f"bot management response (HTTP {response.status_code})"
+            return result
+
+        if response.status_code == 404:
+            last_note = "HTTP 404"
+            continue
+
+        if response.status_code >= 500:
+            last_note = f"server error HTTP {response.status_code}"
+            continue
+
+        match = PDP_PATH_RE.search(response.url)
+        if match and match.group(1) == omsid:
+            result.status = STATUS_LIVE
+            result.url = response.url.split("?")[0]
+            result.product_name = extract_title(response.text)
+            return result
+
+        last_note = f"resolved to non-PDP URL: {response.url[:180]}"
+
+    # Every template answered without a block and none produced a PDP for this
+    # item id, so the site is telling us the OMSID is not live.
+    result.status = STATUS_NOT_FOUND
+    result.note = last_note or "no template resolved to a PDP"
+    return result
+
+
+TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def extract_title(html: str) -> str:
+    match = TITLE_RE.search(html or "")
+    if not match:
+        return ""
+    title = re.sub(r"\s+", " ", match.group(1)).strip()
+    for suffix in (" - The Home Depot", " | The Home Depot"):
+        if title.endswith(suffix):
+            title = title[: -len(suffix)]
+    return title[:250]
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Config:
+    method: str = "auto"
+    workers: int = 3
+    delay: float = 1.0
+    jitter: float = 0.75
+    timeout: float = 25.0
+    max_attempts: int = 3
+    verbose: bool = False
+
+
+def check_one(omsid: str, pool: SessionPool, cfg: Config) -> LookupResult:
+    """
+    Resolve a single OMSID, retrying transient failures and re-warming the
+    session after a block.
+    """
+    methods: List[str]
+    if cfg.method == "graphql":
+        methods = ["graphql"]
+    elif cfg.method == "redirect":
+        methods = ["redirect"]
+    else:
+        methods = ["graphql", "redirect"]
+
+    last_result = LookupResult(omsid=omsid, status=STATUS_ERROR, note="not attempted")
+    attempts = 0
+
+    for method in methods:
+        for attempt in range(1, cfg.max_attempts + 1):
+            attempts += 1
+            time.sleep(cfg.delay + random.uniform(0, cfg.jitter))
+
+            session = pool.session
+            if method == "graphql":
+                result = graphql_lookup(session, omsid, cfg.timeout)
+            else:
+                result = redirect_lookup(session, omsid, cfg.timeout)
+
+            result.attempts = attempts
+            last_result = result
+
+            if result.status in TERMINAL_STATUSES:
+                return result.stamp()
+
+            if result.status == STATUS_BLOCKED:
+                pool.reset()
+                backoff = min(60.0, (2 ** attempt) + random.uniform(0, 3))
+                if cfg.verbose:
+                    print(
+                        f"    [{omsid}] blocked on {method}; sleeping {backoff:.1f}s",
+                        file=sys.stderr,
+                    )
+                time.sleep(backoff)
+                continue
+
+            # STATUS_ERROR -- short backoff, then retry the same method.
+            time.sleep(min(20.0, 1.5 * attempt))
+
+        if cfg.verbose:
+            print(
+                f"    [{omsid}] {method} exhausted ({last_result.status}: "
+                f"{last_result.note[:100]})",
+                file=sys.stderr,
+            )
+
+    return last_result.stamp()
+
+
+class ResultCache:
+    """Incremental JSON cache so a long run can be interrupted and resumed."""
+
+    def __init__(self, path: Optional[Path], flush_every: int = 25):
+        self.path = path
+        self.flush_every = flush_every
+        self._data: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._since_flush = 0
+        if path and path.exists():
+            try:
+                self._data = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                self._data = {}
+
+    def get(self, omsid: str) -> Optional[LookupResult]:
+        record = self._data.get(omsid)
+        if not record:
+            return None
+        try:
+            return LookupResult(**record)
+        except TypeError:
+            return None
+
+    def put(self, result: LookupResult) -> None:
+        if self.path is None:
+            return
+        with self._lock:
+            self._data[result.omsid] = asdict(result)
+            self._since_flush += 1
+            if self._since_flush >= self.flush_every:
+                self._flush_locked()
+
+    def close(self) -> None:
+        if self.path is None:
+            return
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        try:
+            self.path.write_text(
+                json.dumps(self._data, indent=2), encoding="utf-8"
+            )
+            self._since_flush = 0
+        except OSError as exc:
+            print(f"WARNING: could not write cache: {exc}", file=sys.stderr)
+
+
+def run_lookups(
+    omsids: List[str], cfg: Config, pool: SessionPool, cache: ResultCache,
+    resume: bool
+) -> Dict[str, LookupResult]:
+    results: Dict[str, LookupResult] = {}
+    pending: List[str] = []
+
+    for omsid in omsids:
+        cached = cache.get(omsid) if resume else None
+        if cached and cached.status in TERMINAL_STATUSES:
+            results[omsid] = cached
+        else:
+            pending.append(omsid)
+
+    if resume and results:
+        print(f"Resuming: {len(results)} OMSIDs already resolved from cache.")
+
+    total = len(pending)
+    if total == 0:
+        return results
+
+    print(f"Checking {total} unique OMSIDs with {cfg.workers} worker(s)...")
+    completed = 0
+    progress_lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=cfg.workers) as executor:
+        futures = {
+            executor.submit(check_one, omsid, pool, cfg): omsid
+            for omsid in pending
+        }
+        for future in as_completed(futures):
+            omsid = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:  # defensive; a worker should not raise
+                result = LookupResult(
+                    omsid=omsid,
+                    status=STATUS_ERROR,
+                    note=f"worker exception: {type(exc).__name__}: {exc}",
+                ).stamp()
+            results[omsid] = result
+            cache.put(result)
+
+            with progress_lock:
+                completed += 1
+                if completed % 10 == 0 or completed == total:
+                    print(f"  {completed}/{total} checked", flush=True)
+
+    cache.close()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+OUTPUT_COLUMNS = [
+    ("Status", "status", 12),
+    ("URL", "url", 70),
+    ("Product Name", "product_name", 45),
+    ("Brand", "brand", 18),
+    ("Model Number", "model_number", 20),
+    ("Store SKU", "store_sku", 14),
+    ("Method", "method", 11),
+    ("HTTP", "http_status", 8),
+    ("Attempts", "attempts", 10),
+    ("Checked (UTC)", "checked_utc", 20),
+    ("Note", "note", 55),
+]
+
+HEADER_FILL = PatternFill("solid", fgColor="1F3864")
+HEADER_FONT = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+BODY_FONT = Font(name="Arial", size=10)
+LINK_FONT = Font(name="Arial", size=10, color="0563C1", underline="single")
+
+STATUS_FILLS = {
+    STATUS_LIVE: PatternFill("solid", fgColor="E2EFDA"),
+    STATUS_NOT_FOUND: PatternFill("solid", fgColor="F2F2F2"),
+    STATUS_BLOCKED: PatternFill("solid", fgColor="FCE4D6"),
+    STATUS_ERROR: PatternFill("solid", fgColor="FFF2CC"),
+    STATUS_INVALID: PatternFill("solid", fgColor="FFD9D9"),
+}
+
+
+def coerce_for_excel(value: Any) -> Any:
+    """
+    openpyxl rejects numpy scalars and pandas NaT. Convert to native Python.
+    """
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    if value is pd.NaT:
+        return None
+    if isinstance(value, (str, int, float, bool, datetime)):
+        return value
+    if hasattr(value, "item"):  # numpy scalar
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    return str(value)
+
+
+def write_output(
+    df: "pd.DataFrame",
+    omsid_col: str,
+    results: Dict[str, LookupResult],
+    out_path: Path,
+    cfg: Config,
+    input_path: Path,
+) -> Dict[str, int]:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Results"
+
+    source_columns = [c for c in df.columns if c != "_omsid_norm"]
+    headers = [str(c) for c in source_columns] + [h for h, _, _ in OUTPUT_COLUMNS]
+
+    for col_idx, header in enumerate(headers, start=1):
+        cell = sheet.cell(row=1, column=col_idx, value=header)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(vertical="center", horizontal="left")
+
+    counts: Dict[str, int] = {}
+
+    for row_offset, (_, row) in enumerate(df.iterrows()):
+        excel_row = row_offset + 2
+
+        for col_idx, source_col in enumerate(source_columns, start=1):
+            cell = sheet.cell(
+                row=excel_row,
+                column=col_idx,
+                value=coerce_for_excel(row[source_col]),
+            )
+            cell.font = BODY_FONT
+
+        normalized = row["_omsid_norm"]
+        if not isinstance(normalized, str) or not normalized:
+            result = LookupResult(
+                omsid="",
+                status=STATUS_INVALID,
+                url=NOT_APPLICABLE,
+                note="no usable OMSID in this row",
+            )
+        else:
+            result = results.get(
+                normalized,
+                LookupResult(
+                    omsid=normalized,
+                    status=STATUS_ERROR,
+                    note="not checked",
+                ),
+            )
+
+        counts[result.status] = counts.get(result.status, 0) + 1
+
+        base = len(source_columns)
+        for offset, (_header, attr, _width) in enumerate(OUTPUT_COLUMNS, start=1):
+            value = getattr(result, attr)
+            if value is None or value == "":
+                value = "" if attr != "url" else NOT_APPLICABLE
+            cell = sheet.cell(row=excel_row, column=base + offset, value=value)
+            cell.font = BODY_FONT
+
+            if attr == "status":
+                fill = STATUS_FILLS.get(result.status)
+                if fill:
+                    cell.fill = fill
+            elif attr == "url" and result.status == STATUS_LIVE and value != NOT_APPLICABLE:
+                cell.hyperlink = value
+                cell.font = LINK_FONT
+
+    # Column widths.
+    for col_idx, source_col in enumerate(source_columns, start=1):
+        width = max(12, min(40, len(str(source_col)) + 6))
+        sheet.column_dimensions[get_column_letter(col_idx)].width = width
+    base = len(source_columns)
+    for offset, (_header, _attr, width) in enumerate(OUTPUT_COLUMNS, start=1):
+        sheet.column_dimensions[get_column_letter(base + offset)].width = width
+
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = (
+        f"A1:{get_column_letter(len(headers))}{sheet.max_row}"
+    )
+
+    # Summary sheet.
+    summary = workbook.create_sheet("Run Summary")
+    summary_rows = [
+        ("Input file", str(input_path)),
+        ("OMSID column", str(omsid_col)),
+        ("Total input rows", len(df)),
+        ("Unique OMSIDs checked", len(results)),
+        ("Method", cfg.method),
+        ("Workers", cfg.workers),
+        ("Delay (s)", cfg.delay),
+        ("Run finished (UTC)",
+         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+        ("", ""),
+        ("Status", "Row count"),
+    ]
+    for status in (STATUS_LIVE, STATUS_NOT_FOUND, STATUS_BLOCKED,
+                   STATUS_ERROR, STATUS_INVALID):
+        summary_rows.append((status, counts.get(status, 0)))
+    summary_rows.extend(
+        [
+            ("", ""),
+            ("Status meanings", ""),
+            (STATUS_LIVE, "Item resolved to a live PDP; URL populated."),
+            (STATUS_NOT_FOUND,
+             "Absent from Home Depot's published sitemaps. USUALLY means not "
+             "live, but coverage is imperfect -- treat as 'needs review', not "
+             "'confirmed dead'. See the Needs Review sheet."),
+            (STATUS_BLOCKED,
+             "Bot management intercepted the request. NOT a dead item -- re-run."),
+            (STATUS_ERROR,
+             "Network or parse failure. NOT a dead item -- re-run."),
+            (STATUS_INVALID, "The input row contained no usable OMSID."),
+        ]
+    )
+
+    for row_idx, (label, value) in enumerate(summary_rows, start=1):
+        left = summary.cell(row=row_idx, column=1, value=label)
+        right = summary.cell(row=row_idx, column=2, value=value)
+        left.font = Font(name="Arial", size=10, bold=True)
+        right.font = BODY_FONT
+    summary.column_dimensions["A"].width = 26
+    summary.column_dimensions["B"].width = 72
+
+    # Needs Review sheet: the NOT_FOUND rows, isolated for manual or API
+    # verification. Sitemap coverage is imperfect, so these are candidates for
+    # a second pass rather than confirmed-dead items.
+    review = workbook.create_sheet("Needs Review")
+    review_headers = ["OMSID", "Row in Results", "Verify URL", "Confirmed?",
+                      "Notes"]
+    for col_idx, header in enumerate(review_headers, start=1):
+        cell = review.cell(row=1, column=col_idx, value=header)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+
+    review_row = 2
+    for row_offset, (_, row) in enumerate(df.iterrows()):
+        normalized = row["_omsid_norm"]
+        if not isinstance(normalized, str) or not normalized:
+            continue
+        result = results.get(normalized)
+        if not result or result.status != STATUS_NOT_FOUND:
+            continue
+        search_url = f"{BASE_URL}/s/{normalized}"
+        values = [normalized, row_offset + 2, search_url, "", ""]
+        for col_idx, value in enumerate(values, start=1):
+            cell = review.cell(row=review_row, column=col_idx, value=value)
+            cell.font = BODY_FONT
+            if col_idx == 3:
+                cell.hyperlink = search_url
+                cell.font = LINK_FONT
+        review_row += 1
+
+    for letter, width in (("A", 14), ("B", 16), ("C", 46), ("D", 13), ("E", 44)):
+        review.column_dimensions[letter].width = width
+    review.freeze_panes = "A2"
+    if review_row > 2:
+        review.auto_filter.ref = f"A1:E{review_row - 1}"
+    else:
+        review.cell(row=2, column=1,
+                    value="No NOT_FOUND rows -- nothing to review.").font = BODY_FONT
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(out_path)
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Validation mode
+# ---------------------------------------------------------------------------
+
+
+def validate(omsids: List[str], cfg: Config, pool: SessionPool) -> int:
+    """
+    Probe every query variant against known OMSIDs and print raw diagnostics.
+    Run this before committing to a large job.
+    """
+    print("=" * 78)
+    print("VALIDATION MODE")
+    print("=" * 78)
+
+    session = pool.session
+    print(f"Cookies acquired after warm-up: {len(session.cookies)}")
+    if len(session.cookies) == 0:
+        print("  WARNING: no cookies. The homepage request was blocked outright.")
+
+    any_live = False
+    any_blocked = False
+    working_variant = None
+
+    for omsid in omsids:
+        print(f"\nOMSID {omsid}")
+        print("-" * 46)
+
+        for index, (name, _query, _vars) in enumerate(QUERY_VARIANTS):
+            result, _definitive = _graphql_attempt(session, omsid, cfg.timeout, index)
+            flag = "  <-- WORKS" if result.status == STATUS_LIVE else ""
+            print(f"  variant {name:<22} status={result.status:<10} "
+                  f"http={result.http_status}{flag}")
+            if result.url and result.url != NOT_APPLICABLE:
+                print(f"          {result.url}")
+            if result.product_name:
+                print(f"          {result.product_name[:80]}")
+            if result.note and result.status != STATUS_LIVE:
+                print(f"          note: {result.note[:150]}")
+
+            if result.status == STATUS_LIVE:
+                any_live = True
+                if working_variant is None:
+                    working_variant = name
+                break
+            if result.status == STATUS_BLOCKED:
+                any_blocked = True
+
+            time.sleep(cfg.delay + random.uniform(0, cfg.jitter))
+
+        time.sleep(cfg.delay)
+
+        red = redirect_lookup(session, omsid, cfg.timeout)
+        print(f"  REDIRECT method        status={red.status:<10} "
+              f"http={red.http_status}")
+        if red.status == STATUS_BLOCKED:
+            any_blocked = True
+
+    print("\n" + "=" * 78)
+    if any_live:
+        print(f"RESULT: WORKING. Query variant '{working_variant}' returns live data.")
+        print("        Set MODE = \"test\" at the top of this file and run again.")
+        print("=" * 78)
+        return 0
+
+    if any_blocked:
+        print("RESULT: BLOCKED. Bot management is rejecting requests from this IP.")
+    else:
+        print("RESULT: NO DATA. The API answered but returned null for every")
+        print("        variant. Either these test OMSIDs are no longer live,")
+        print("        or the query shape has changed again.")
+        print("        Set DEBUG_DUMP = True and re-run to capture raw responses")
+        print("        in debug_response.txt.")
+    print("=" * 78)
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Resolve Home Depot OMSIDs to live PDP URLs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("-i", "--input", type=Path, help="Input .xlsx file.")
+    parser.add_argument(
+        "-o", "--output", type=Path, default=Path("omsid_results.xlsx"),
+        help="Output .xlsx file."
+    )
+    parser.add_argument("--sheet", default=None, help="Input sheet name.")
+    parser.add_argument(
+        "--column", default=None,
+        help="Input column holding the OMSIDs. Auto-detected if omitted."
+    )
+    parser.add_argument(
+        "--method", choices=("auto", "graphql", "redirect"), default="auto",
+        help="Lookup strategy."
+    )
+    parser.add_argument("--workers", type=int, default=3,
+                        help="Concurrent requests. Keep this low.")
+    parser.add_argument("--delay", type=float, default=1.0,
+                        help="Base delay in seconds before each request.")
+    parser.add_argument("--jitter", type=float, default=0.75,
+                        help="Random additional delay, 0 to this value.")
+    parser.add_argument("--timeout", type=float, default=25.0,
+                        help="Per-request timeout in seconds.")
+    parser.add_argument("--max-attempts", type=int, default=3,
+                        help="Attempts per method before giving up.")
+    parser.add_argument("--proxy", default=None,
+                        help="Proxy URL, e.g. http://user:pass@host:port")
+    parser.add_argument("--cache", type=Path, default=None,
+                        help="JSON cache path for incremental saves.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip OMSIDs already resolved in --cache.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Only check the first N unique OMSIDs (testing).")
+    parser.add_argument("--validate", nargs="+", metavar="OMSID", default=None,
+                        help="Diagnostic mode; probe these OMSIDs and exit.")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+
+    cfg = Config(
+        method=args.method,
+        workers=max(1, args.workers),
+        delay=max(0.0, args.delay),
+        jitter=max(0.0, args.jitter),
+        timeout=args.timeout,
+        max_attempts=max(1, args.max_attempts),
+        verbose=args.verbose,
+    )
+    pool = SessionPool(args.proxy, cfg.timeout, verbose=True)
+
+    if args.validate:
+        cleaned = [normalize_omsid(v) or v for v in args.validate]
+        return validate(cleaned, cfg, pool)
+
+    if not args.input:
+        print("ERROR: --input is required (or use --validate).", file=sys.stderr)
+        return 1
+    if not args.input.exists():
+        print(f"ERROR: input file not found: {args.input}", file=sys.stderr)
+        return 1
+
+    df, omsid_col = load_input(args.input, args.sheet, args.column)
+    print(f"Loaded {len(df)} rows from {args.input.name}; "
+          f"OMSID column = {omsid_col!r}")
+
+    unique: List[str] = []
+    seen = set()
+    for value in df["_omsid_norm"]:
+        if isinstance(value, str) and value and value not in seen:
+            seen.add(value)
+            unique.append(value)
+
+    invalid_rows = int(df["_omsid_norm"].isna().sum())
+    if invalid_rows:
+        print(f"  {invalid_rows} row(s) contain no usable OMSID; "
+              "they will be marked INVALID.")
+
+    if args.limit:
+        unique = unique[: args.limit]
+        print(f"  --limit applied: checking {len(unique)} OMSID(s).")
+
+    if not unique:
+        print("ERROR: no valid OMSIDs found in the input.", file=sys.stderr)
+        return 1
+
+    cache = ResultCache(args.cache)
+    started = time.time()
+    results = run_lookups(unique, cfg, pool, cache, args.resume)
+    elapsed = time.time() - started
+
+    counts = write_output(df, omsid_col, results, args.output, cfg, args.input)
+
+    print("\n" + "-" * 60)
+    print(f"Finished in {elapsed / 60:.1f} minutes.")
+    for status in (STATUS_LIVE, STATUS_NOT_FOUND, STATUS_BLOCKED,
+                   STATUS_ERROR, STATUS_INVALID):
+        print(f"  {status:<11} {counts.get(status, 0)}")
+    print(f"\nWorkbook written to: {args.output}")
+
+    unresolved = counts.get(STATUS_BLOCKED, 0) + counts.get(STATUS_ERROR, 0)
+    if unresolved:
+        print(
+            f"\n{unresolved} row(s) did NOT get a definitive answer. Those are "
+            "not confirmed-dead items.\nRe-run with --cache and --resume to "
+            "retry only the unresolved OMSIDs."
+        )
+        return 3
+    return 0
+
+
+def probe(cfg: Config, pool: SessionPool) -> int:
+    """
+    Fetch a battery of Home Depot URLs and report the raw status of each.
+
+    The point is to separate two very different failures that both surface as
+    403: bot management rejecting the session, versus a URL pattern that simply
+    is not valid. The homepage and KNOWN_GOOD_URL act as controls.
+    """
+    print("=" * 78)
+    print("PROBE MODE -- testing which URL patterns respond")
+    print("=" * 78)
+
+    session = pool.session
+    omsid = None
+    for candidate in VALIDATION_OMSIDS:
+        omsid = normalize_omsid(candidate)
+        if omsid:
+            break
+    if not omsid:
+        print("ERROR: no usable OMSID in VALIDATION_OMSIDS.")
+        return 1
+
+    targets = [("homepage (control)", f"{BASE_URL}/")]
+    if KNOWN_GOOD_URL:
+        targets.append(("KNOWN_GOOD_URL (control)", KNOWN_GOOD_URL))
+    else:
+        print("NOTE: KNOWN_GOOD_URL is empty. Filling it in makes this test")
+        print("      far more conclusive. See the settings block.\n")
+
+    targets += [
+        ("placeholder slug", f"{BASE_URL}/p/x/{omsid}"),
+        ("bare id path", f"{BASE_URL}/p/{omsid}"),
+        ("site search", f"{BASE_URL}/s/{omsid}"),
+        ("search query", f"{BASE_URL}/b/search?q={omsid}"),
+    ]
+
+    results = []
+    for label, url in targets:
+        line = f"  {label:<26}"
+        try:
+            response = session.get(
+                url,
+                headers=html_headers(),
+                timeout=cfg.timeout,
+                allow_redirects=True,
+            )
+        except HTTP_ERRORS as exc:
+            print(f"{line} FAILED  {type(exc).__name__}")
+            results.append((label, None))
+            continue
+
+        code = response.status_code
+        final = str(response.url)
+        title = extract_title(response.text)
+        match = PDP_PATH_RE.search(final)
+        is_pdp = bool(match and match.group(1) == omsid and code == 200)
+
+        print(f"{line} HTTP {code}   len={len(response.text)}")
+        if final.rstrip("/") != url.rstrip("/"):
+            print(f"    {'':<24} -> {final[:110]}")
+        if title:
+            print(f"    {'':<24} title: {title[:80]}")
+        if is_pdp:
+            print(f"    {'':<24} *** THIS IS A PRODUCT PAGE FOR {omsid} ***")
+
+        _dump_debug(f"probe {label} -> {url}", response)
+        results.append((label, code))
+
+    codes = dict(results)
+    home = codes.get("homepage (control)")
+    good = codes.get("KNOWN_GOOD_URL (control)")
+
+    print("\n" + "=" * 78)
+    if home == 200 and good == 200:
+        print("READING: the site serves real pages to this script. You are NOT")
+        print("         blocked. Any 403s above are invalid URL patterns, not")
+        print("         bot management. A working approach is within reach.")
+        code = 0
+    elif home == 200 and good is None:
+        print("READING: homepage works. Fill in KNOWN_GOOD_URL and re-run to")
+        print("         confirm whether real product pages load.")
+        code = 0
+    elif home == 200:
+        print(f"READING: homepage works but a known-good product URL returned "
+              f"{good}.")
+        print("         Product pages specifically are being protected.")
+        code = 2
+    else:
+        print(f"READING: even the homepage returned {home}. The session is")
+        print("         being rejected outright.")
+        code = 2
+    print("=" * 78)
+    return code
+
+
+def network_check(cfg: Config, pool: SessionPool) -> int:
+    """
+    Report this machine's public IP and what kind of network it belongs to.
+
+    A VPN cannot be switched off from Python -- that is an operating-system
+    action requiring elevated rights. What this can do is tell you whether one
+    is active, which is the question that actually matters.
+    """
+    print("=" * 78)
+    print("NETWORK CHECK")
+    print("=" * 78)
+
+    print(f"  TLS impersonation available (curl_cffi): {CURL_CFFI_AVAILABLE}")
+    print(f"  TLS impersonation enabled:               "
+          f"{USE_CURL_CFFI and CURL_CFFI_AVAILABLE}")
+    if USE_CURL_CFFI and not CURL_CFFI_AVAILABLE:
+        print("    -> curl_cffi is not installed. Run:  pip install curl_cffi")
+    print(f"  Proxy configured in settings:            {PROXY or 'none'}")
+    print()
+
+    services = [
+        ("https://ipinfo.io/json", ("ip", "org", "city", "region", "country")),
+        ("https://ipapi.co/json/", ("ip", "org", "city", "region", "country_name")),
+    ]
+
+    info = None
+    for url, fields in services:
+        try:
+            response = pool.session.get(url, timeout=cfg.timeout)
+            if response.status_code == 200:
+                info = (response.json(), fields, url)
+                break
+        except Exception as exc:
+            print(f"  {url} failed: {type(exc).__name__}")
+        except BaseException:
+            pass
+
+    if info is None:
+        print("  Could not reach any IP lookup service.")
+        print("  Check your internet connection, then try again.")
+        print("=" * 78)
+        return 1
+
+    data, fields, source = info
+    print(f"  Source: {source}")
+    for field in fields:
+        value = data.get(field)
+        if value:
+            print(f"    {field:<12} {value}")
+
+    org = str(data.get("org", "")).lower()
+    print()
+
+    datacenter_markers = (
+        "amazon", "aws", "google", "microsoft", "azure", "digitalocean",
+        "linode", "ovh", "hetzner", "vultr", "cloudflare", "oracle",
+        "datacamp", "m247", "leaseweb", "choopa", "hosting", "vpn",
+        "private internet", "nordvpn", "expressvpn", "surfshark", "mullvad",
+        "proton", "datacenter", "server",
+    )
+    residential_markers = (
+        "spectrum", "charter", "comcast", "xfinity", "at&t", "att ",
+        "verizon", "cox", "frontier", "centurylink", "t-mobile", "sonic",
+        "optimum", "cable", "telecom", "communications", "broadband",
+    )
+
+    hits = [m for m in datacenter_markers if m in org]
+    res_hits = [m for m in residential_markers if m in org]
+
+    if hits:
+        print(f"  ASSESSMENT: this looks like a VPN, hosting, or datacenter IP.")
+        print(f"              matched: {', '.join(hits)}")
+        print("              Disconnect it and re-run this check.")
+    elif res_hits:
+        print("  ASSESSMENT: this looks like a normal residential ISP.")
+        print("              No VPN appears to be active.")
+    else:
+        print("  ASSESSMENT: inconclusive. Read the 'org' value above -- if it")
+        print("              names your home internet provider, you are fine.")
+
+    print("=" * 78)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Playwright engine
+# ---------------------------------------------------------------------------
+
+BLOCK_TITLE_MARKERS = ("error page", "access denied", "pardon our interruption")
+
+
+class PlaywrightEngine:
+    """
+    Drives a real Chromium browser.
+
+    Home Depot serves product pages only to clients that have executed its
+    JavaScript challenge, so an HTTP library cannot reach them at any speed.
+    This is slower -- a few seconds per item rather than one -- but it is the
+    difference between data and 403s.
+
+    One browser, one page, sequential navigation. Parallel contexts would be
+    faster but multiply the chance of tripping rate limits, and the whole point
+    here is to look like a person browsing.
+    """
+
+    def __init__(self, cfg: Config, proxy: Optional[str] = None):
+        self.cfg = cfg
+        self.proxy = proxy
+        self._pw = None
+        self._browser = None
+        self._context = None
+        self._page = None
+
+    def __enter__(self) -> "PlaywrightEngine":
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise SystemExit(
+                "Playwright is not installed. In the PyCharm Terminal tab run:\n"
+                "    pip install playwright\n"
+                "    playwright install chromium"
+            )
+
+        self._pw = sync_playwright().start()
+
+        launch_args = {
+            "headless": HEADLESS,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+            ],
+        }
+        if self.proxy:
+            launch_args["proxy"] = {"server": self.proxy}
+
+        try:
+            self._browser = self._pw.chromium.launch(**launch_args)
+        except Exception as exc:
+            self._pw.stop()
+            raise SystemExit(
+                f"Could not launch Chromium: {exc}\n"
+                "If the browser is missing, run:  playwright install chromium"
+            )
+
+        self._context = self._browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            locale="en-US",
+            timezone_id="America/Los_Angeles",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+        )
+        # Hide the most obvious automation tell before any page script runs.
+        self._context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        self._page = self._context.new_page()
+        self._warm()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        for closer in (self._context, self._browser):
+            try:
+                if closer:
+                    closer.close()
+            except Exception:
+                pass
+        try:
+            if self._pw:
+                self._pw.stop()
+        except Exception:
+            pass
+
+    def _warm(self) -> None:
+        """Load the homepage so the Akamai challenge runs and sets its cookie."""
+        print("  Warming browser session (loading homepage)...")
+        try:
+            self._page.goto(
+                f"{BASE_URL}/",
+                wait_until="domcontentloaded",
+                timeout=PAGE_TIMEOUT_MS,
+            )
+            self._page.wait_for_timeout(3000)
+            cookies = self._context.cookies()
+            names = {c["name"] for c in cookies}
+            has_sensor = "_abck" in names
+            print(f"  Cookies: {len(cookies)}   Akamai sensor present: {has_sensor}")
+            if not has_sensor:
+                print("  NOTE: the _abck cookie is absent. Product pages may still 403.")
+        except Exception as exc:
+            print(f"  Warm-up failed: {type(exc).__name__}: {exc}")
+
+    def lookup(self, omsid: str) -> LookupResult:
+        result = LookupResult(omsid=omsid, method="PLAYWRIGHT")
+        url = f"{BASE_URL}/p/x/{omsid}"
+
+        try:
+            response = self._page.goto(
+                url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS
+            )
+            self._page.wait_for_timeout(PAGE_SETTLE_MS)
+        except Exception as exc:
+            result.status = STATUS_ERROR
+            result.note = f"navigation failed: {type(exc).__name__}: {exc}"[:200]
+            return result.stamp()
+
+        result.http_status = response.status if response else None
+        final_url = self._page.url
+
+        try:
+            title = self._page.title()
+        except Exception:
+            title = ""
+
+        lowered = title.lower()
+        if any(marker in lowered for marker in BLOCK_TITLE_MARKERS):
+            result.status = STATUS_BLOCKED
+            result.note = f"block page returned (title: {title[:60]})"
+            return result.stamp()
+
+        match = PDP_PATH_RE.search(final_url)
+        if match and match.group(1) == omsid:
+            result.status = STATUS_LIVE
+            result.url = final_url.split("?")[0]
+            for suffix in (" - The Home Depot", " | The Home Depot"):
+                if title.endswith(suffix):
+                    title = title[: -len(suffix)]
+            result.product_name = title[:250]
+            return result.stamp()
+
+        if result.http_status in (403, 429):
+            result.status = STATUS_BLOCKED
+            result.note = f"HTTP {result.http_status} on product page"
+            return result.stamp()
+
+        result.status = STATUS_NOT_FOUND
+        result.note = f"resolved to {final_url[:150]}"
+        return result.stamp()
+
+
+# ---------------------------------------------------------------------------
+# Sitemap engine
+#
+# Retailers publish XML sitemaps so search engines can crawl their catalog, and
+# every Home Depot product URL ends in the OMSID. Those files are served for
+# crawlers, so they are usually not behind the protection that guards
+# interactive product pages. If they are reachable, one bulk download gives a
+# complete offline OMSID -> URL index: no per-item requests, no rate limits,
+# and repeat runs cost nothing.
+# ---------------------------------------------------------------------------
+
+SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+
+def fetch_bytes(session, url: str, timeout: float) -> Tuple[Optional[bytes], int]:
+    """Fetch a URL, transparently decompressing .gz payloads."""
+    try:
+        response = session.get(url, headers=html_headers(), timeout=timeout)
+    except HTTP_ERRORS:
+        return None, 0
+
+    if response.status_code != 200:
+        return None, response.status_code
+
+    content = response.content
+    if url.endswith(".gz") or content[:2] == b"\x1f\x8b":
+        try:
+            content = gzip.decompress(content)
+        except OSError:
+            try:
+                content = gzip.GzipFile(fileobj=io.BytesIO(content)).read()
+            except OSError:
+                return None, response.status_code
+    return content, response.status_code
+
+
+def parse_sitemap(content: bytes) -> Tuple[str, List[str]]:
+    """
+    Return (kind, locations) where kind is "index", "urlset", or "unknown".
+    """
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return "unknown", []
+
+    tag = root.tag.split("}")[-1]
+    locs = [
+        node.text.strip()
+        for node in root.iter()
+        if node.tag.split("}")[-1] == "loc" and node.text
+    ]
+    if tag == "sitemapindex":
+        return "index", locs
+    if tag == "urlset":
+        return "urlset", locs
+    return "unknown", locs
+
+
+def discover_sitemaps(session, cfg: Config) -> List[str]:
+    """Read robots.txt for declared sitemaps, with sensible fallbacks."""
+    found: List[str] = []
+    content, code = fetch_bytes(session, f"{BASE_URL}/robots.txt", cfg.timeout)
+    print(f"  robots.txt -> HTTP {code}")
+    if content:
+        for line in content.decode("utf-8", "ignore").splitlines():
+            if line.lower().startswith("sitemap:"):
+                found.append(line.split(":", 1)[1].strip())
+
+    if not found:
+        print("  No Sitemap: lines in robots.txt. Trying common paths.")
+        for guess in ("/sitemap.xml", "/sitemap_index.xml", "/sitemap/index.xml"):
+            probe_url = BASE_URL + guess
+            content, code = fetch_bytes(session, probe_url, cfg.timeout)
+            print(f"  {guess} -> HTTP {code}")
+            if content:
+                found.append(probe_url)
+                break
+    return found
+
+
+def sitemap_test(cfg: Config, pool: SessionPool) -> int:
+    """Cheap reachability check before committing to a full download."""
+    print("=" * 78)
+    print("SITEMAP TEST")
+    print("=" * 78)
+
+    session = pool.session
+    roots = discover_sitemaps(session, cfg)
+
+    if not roots:
+        print("\n  No sitemaps reachable.")
+        print("=" * 78)
+        return 2
+
+    print(f"\n  Found {len(roots)} declared sitemap(s):")
+    for url in roots[:12]:
+        print(f"    {url}")
+    if len(roots) > 12:
+        print(f"    ... and {len(roots) - 12} more")
+
+    # Walk down to one real product sitemap and count what it holds.
+    queue = list(roots)
+    product_files: List[str] = []
+    seen = set()
+    depth = 0
+
+    while queue and depth < 3 and not product_files:
+        depth += 1
+        next_queue: List[str] = []
+        for url in queue[:6]:
+            if url in seen:
+                continue
+            seen.add(url)
+            content, code = fetch_bytes(session, url, cfg.timeout)
+            if not content:
+                print(f"    {url[:80]} -> HTTP {code}")
+                continue
+            kind, locs = parse_sitemap(content)
+            pdp = [u for u in locs if PDP_PATH_RE.search(u)]
+            print(f"    {url[:70]} -> {kind}, {len(locs)} locs, {len(pdp)} products")
+            if pdp:
+                product_files.append(url)
+                sample = pdp[:3]
+                print("\n  Sample product URLs found:")
+                for s in sample:
+                    m = PDP_PATH_RE.search(s)
+                    print(f"    OMSID {m.group(1)}  {s[:88]}")
+                break
+            if kind == "index":
+                next_queue.extend(locs)
+            time.sleep(cfg.delay)
+        queue = next_queue
+
+    print("\n" + "=" * 78)
+    if product_files:
+        print("READING: sitemaps are reachable AND contain product URLs with")
+        print("         OMSIDs in them. This approach works.")
+        print('         Set MODE = "sitemap" and run again to build the index.')
+        print("=" * 78)
+        return 0
+
+    print("READING: sitemaps responded but no product URLs were found at this")
+    print("         depth. Send me this output and I will adjust the walk.")
+    print("=" * 78)
+    return 2
+
+
+def build_sitemap_index(
+    cfg: Config, pool: SessionPool, wanted: Optional[set] = None
+) -> Dict[str, str]:
+    """
+    Download product sitemaps and build {omsid: url}.
+
+    When `wanted` is supplied, only those OMSIDs are kept and the crawl stops
+    as soon as every one has been found. Home Depot publishes roughly 4.2
+    million products; indexing all of them to answer a few hundred questions
+    would be wasteful.
+
+    The cache records which OMSIDs were searched for. If a later run asks about
+    OMSIDs the cached crawl never looked for, the cache is discarded rather
+    than reporting a false NOT_FOUND.
+    """
+    cache_path = Path(SITEMAP_INDEX_FILE)
+
+    if cache_path.exists() and not SITEMAP_REBUILD:
+        try:
+            blob = json.loads(cache_path.read_text(encoding="utf-8"))
+            cached_scope = blob.get("scope")
+            found = blob.get("found", {})
+            usable = (
+                cached_scope == "all"
+                or wanted is None and cached_scope == "all"
+                or (wanted is not None and cached_scope is not None
+                    and cached_scope != "all"
+                    and wanted.issubset(set(cached_scope)))
+            )
+            if usable:
+                print(f"Loaded cached index: {len(found):,} OMSIDs matched "
+                      f"(set SITEMAP_REBUILD = True to refresh)")
+                return found
+            print("Cached index does not cover these OMSIDs; rebuilding.")
+        except (ValueError, OSError, AttributeError):
+            print("Cached index unreadable; rebuilding.")
+
+    session = pool.session
+    print("Discovering sitemaps...")
+    queue = discover_sitemaps(session, cfg)
+    if not queue:
+        print("ERROR: no sitemaps reachable.")
+        return {}
+
+    index: Dict[str, str] = {}
+    seen = set()
+    files_read = 0
+    target = len(wanted) if wanted else None
+
+    if target:
+        print(f"Searching for {target:,} OMSIDs. The crawl stops early once "
+              f"all are found.")
+    else:
+        print("Indexing the full catalog. This will take a while.")
+
+    while queue and files_read < SITEMAP_MAX_FILES:
+        url = queue.pop(0)
+        if url in seen:
+            continue
+        seen.add(url)
+
+        content, code = fetch_bytes(session, url, cfg.timeout)
+        if not content:
+            continue
+        files_read += 1
+
+        kind, locs = parse_sitemap(content)
+        if kind == "index":
+            # Product sitemaps first; category and brand pages cannot match.
+            products_first = [u for u in locs if "PIP" in u or "/P/" in u]
+            others = [u for u in locs if u not in products_first]
+            queue = products_first + queue + others
+            continue
+
+        for loc in locs:
+            match = PDP_PATH_RE.search(loc)
+            if not match:
+                continue
+            omsid = match.group(1)
+            if wanted is not None and omsid not in wanted:
+                continue
+            index[omsid] = loc.split("?")[0]
+
+        if target:
+            print(f"  file {files_read}: {len(index):,}/{target:,} found "
+                  f"({len(queue)} queued)")
+            if len(index) >= target:
+                print("  All requested OMSIDs found. Stopping early.")
+                break
+        elif files_read % 10 == 0:
+            print(f"  {files_read} files read, {len(index):,} indexed, "
+                  f"{len(queue)} queued")
+
+        time.sleep(cfg.delay * 0.25)
+
+    print(f"Crawl complete: {len(index):,} matched from {files_read} files.")
+
+    try:
+        blob = {
+            "scope": "all" if wanted is None else sorted(wanted),
+            "found": index,
+            "built_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        cache_path.write_text(json.dumps(blob), encoding="utf-8")
+        print(f"Index cached to {cache_path.resolve()}")
+    except OSError as exc:
+        print(f"WARNING: could not cache index: {exc}")
+    return index
+
+
+def sitemap_audit(cfg: Config, pool: SessionPool) -> int:
+    """
+    Crawl every reachable sitemap and report full statistics.
+
+    The point is to distinguish an incomplete crawl from a genuine gap in
+    Home Depot's published sitemaps. Those look identical in the output of a
+    normal run, but they call for completely different responses.
+    """
+    print("=" * 78)
+    print("SITEMAP AUDIT")
+    print("=" * 78)
+
+    wanted = {v for v in (normalize_omsid(x) for x in AUDIT_OMSIDS) if v}
+    if not wanted:
+        print("ERROR: no usable OMSID in AUDIT_OMSIDS.")
+        return 1
+    print(f"Investigating: {', '.join(sorted(wanted))}\n")
+
+    session = pool.session
+    queue = discover_sitemaps(session, cfg)
+    if not queue:
+        print("ERROR: no sitemaps reachable.")
+        return 2
+
+    seen_urls = set()
+    files_read = 0
+    index_files = 0
+    urlset_files = 0
+    failed_files = 0
+    total_locs = 0
+    total_products = 0
+    unique_omsids = set()
+    found: Dict[str, str] = {}
+    file_of: Dict[str, str] = {}
+
+    while queue and files_read < SITEMAP_MAX_FILES:
+        url = queue.pop(0)
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        content, code = fetch_bytes(session, url, cfg.timeout)
+        if not content:
+            failed_files += 1
+            print(f"  FAILED HTTP {code}: {url[:90]}")
+            continue
+        files_read += 1
+
+        kind, locs = parse_sitemap(content)
+        total_locs += len(locs)
+
+        if kind == "index":
+            index_files += 1
+            queue.extend(locs)
+            continue
+
+        urlset_files += 1
+        products_here = 0
+        for loc in locs:
+            match = PDP_PATH_RE.search(loc)
+            if not match:
+                continue
+            products_here += 1
+            omsid = match.group(1)
+            unique_omsids.add(omsid)
+            if omsid in wanted and omsid not in found:
+                found[omsid] = loc.split("?")[0]
+                file_of[omsid] = url
+                print(f"  *** FOUND {omsid} in {url[-45:]}")
+        total_products += products_here
+
+        if urlset_files % 10 == 0:
+            print(f"  {files_read} files ({urlset_files} urlsets), "
+                  f"{total_products:,} products, {len(found)}/{len(wanted)} targets")
+        time.sleep(cfg.delay * 0.25)
+
+    exhausted = not queue
+    capped = files_read >= SITEMAP_MAX_FILES
+
+    print("\n" + "-" * 78)
+    print("CRAWL STATISTICS")
+    print("-" * 78)
+    print(f"  Files read successfully   {files_read}")
+    print(f"    index files             {index_files}")
+    print(f"    urlset files            {urlset_files}")
+    print(f"  Files that failed         {failed_files}")
+    print(f"  Total <loc> entries       {total_locs:,}")
+    print(f"  Product URLs seen         {total_products:,}")
+    print(f"  Unique OMSIDs seen        {len(unique_omsids):,}")
+    print(f"  Queue exhausted           {exhausted}")
+    print(f"  Hit SITEMAP_MAX_FILES cap {capped}")
+
+    print("\n" + "-" * 78)
+    print("TARGET OMSIDS")
+    print("-" * 78)
+    for omsid in sorted(wanted):
+        if omsid in found:
+            print(f"  {omsid}  FOUND")
+            print(f"            {found[omsid][:92]}")
+            print(f"            in {file_of[omsid][-60:]}")
+        else:
+            print(f"  {omsid}  NOT PRESENT in any sitemap read")
+
+    print("\n" + "=" * 78)
+    missing = wanted - set(found)
+    if not missing:
+        print("READING: every target was found. The earlier NOT_FOUND came from")
+        print("         an incomplete crawl, not a sitemap gap. Re-run with")
+        print("         MODE = \"sitemap\" and SITEMAP_REBUILD = True.")
+        result = 0
+    elif capped or failed_files or not exhausted:
+        print("READING: the crawl did NOT finish cleanly -- it was capped, hit")
+        print("         failures, or left files queued. The missing OMSIDs may")
+        print("         simply never have been read. Raise SITEMAP_MAX_FILES")
+        print("         and run this again.")
+        result = 1
+    else:
+        print("READING: the crawl completed, reading every reachable sitemap,")
+        print(f"         and saw {total_products:,} product URLs. The missing")
+        print("         OMSIDs are genuinely absent from Home Depot's published")
+        print("         sitemaps despite being live on site.")
+        print("         Coverage is imperfect. NOT_FOUND should be read as")
+        print("         'needs review', not 'confirmed dead'.")
+        result = 2
+    print("=" * 78)
+    return result
+
+
+def sitemap_main(cfg: Config, pool: SessionPool) -> int:
+    input_path = Path(INPUT_FILE)
+    if not input_path.exists():
+        print(f"ERROR: input file not found: {input_path.resolve()}", file=sys.stderr)
+        return 1
+
+    df, omsid_col = load_input(input_path, SHEET_NAME, OMSID_COLUMN)
+    print(f"Loaded {len(df)} rows from {input_path.name}; "
+          f"OMSID column = {omsid_col!r}")
+
+    wanted = {
+        value for value in df["_omsid_norm"]
+        if isinstance(value, str) and value
+    }
+    if not wanted:
+        print("ERROR: no valid OMSIDs found in the input.", file=sys.stderr)
+        return 1
+    print(f"  {len(wanted):,} unique OMSIDs to resolve.\n")
+
+    index = build_sitemap_index(
+        cfg, pool, wanted if SITEMAP_FILTER_TO_INPUT else None
+    )
+    if not index and SITEMAP_FILTER_TO_INPUT is False:
+        return 2
+
+    results: Dict[str, LookupResult] = {}
+    for omsid in wanted:
+        url = index.get(omsid)
+        if url:
+            results[omsid] = LookupResult(
+                omsid=omsid, status=STATUS_LIVE, url=url,
+                method="SITEMAP", http_status=200, attempts=1,
+            ).stamp()
+        else:
+            results[omsid] = LookupResult(
+                omsid=omsid, status=STATUS_NOT_FOUND, url=NOT_APPLICABLE,
+                method="SITEMAP", attempts=1,
+                note="not present in Home Depot's published sitemaps",
+            ).stamp()
+
+    counts = write_output(
+        df, omsid_col, results, Path(OUTPUT_FILE), cfg, input_path
+    )
+
+    print("\n" + "-" * 60)
+    for status in (STATUS_LIVE, STATUS_NOT_FOUND, STATUS_INVALID):
+        print(f"  {status:<11} {counts.get(status, 0)}")
+    print(f"\nWorkbook written to: {Path(OUTPUT_FILE).resolve()}")
+    print("\nNOTE: NOT_FOUND means the OMSID is absent from Home Depot's")
+    print("published sitemaps. That is strong evidence the item is not live,")
+    print("but spot-check a few in a browser before acting on it.")
+    return 0
+
+
+def playwright_probe(cfg: Config) -> int:
+    """
+    Test URL patterns inside the warmed browser.
+
+    The browser holds a valid Akamai sensor cookie, so this separates two
+    things the HTTP probe could not: a genuine block, versus a URL pattern
+    that was never valid in the first place.
+    """
+    print("=" * 78)
+    print("PROBE MODE -- browser engine")
+    print("=" * 78)
+
+    omsid = None
+    for candidate in VALIDATION_OMSIDS:
+        omsid = normalize_omsid(candidate)
+        if omsid:
+            break
+    if not omsid:
+        print("ERROR: no usable OMSID in VALIDATION_OMSIDS.")
+        return 1
+
+    targets = [("homepage (control)", f"{BASE_URL}/")]
+    if KNOWN_GOOD_URL:
+        targets.append(("KNOWN_GOOD_URL (control)", KNOWN_GOOD_URL))
+    else:
+        print("WARNING: KNOWN_GOOD_URL is empty. This test is far weaker")
+        print("         without it. Paste in a real product URL and re-run.\n")
+
+    targets += [
+        ("placeholder slug", f"{BASE_URL}/p/x/{omsid}"),
+        ("bare id path", f"{BASE_URL}/p/{omsid}"),
+        ("site search", f"{BASE_URL}/s/{omsid}"),
+        ("search query", f"{BASE_URL}/b/search?q={omsid}"),
+    ]
+
+    outcomes: Dict[str, Optional[int]] = {}
+
+    with PlaywrightEngine(cfg, PROXY) as engine:
+        page = engine._page
+        for label, url in targets:
+            print(f"\n  {label}")
+            print(f"    {url[:110]}")
+            try:
+                response = page.goto(
+                    url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS
+                )
+                page.wait_for_timeout(PAGE_SETTLE_MS)
+            except Exception as exc:
+                print(f"    FAILED: {type(exc).__name__}: {exc}"[:160])
+                outcomes[label] = None
+                continue
+
+            code = response.status if response else None
+            outcomes[label] = code
+            try:
+                title = page.title()
+            except Exception:
+                title = ""
+            final = page.url
+            body_len = len(page.content())
+
+            print(f"    HTTP {code}   len={body_len}")
+            print(f"    title: {title[:80]}")
+            if final.rstrip("/") != url.rstrip("/"):
+                print(f"    redirected to: {final[:110]}")
+
+            match = PDP_PATH_RE.search(final)
+            if code == 200 and match:
+                print(f"    *** PRODUCT PAGE, item id {match.group(1)} ***")
+
+            # Capture what the browser actually rendered, for the controls.
+            if "control" in label:
+                shot = f"probe_{label.split()[0].lower()}.png"
+                try:
+                    page.screenshot(path=shot, full_page=False)
+                    print(f"    screenshot saved: {shot}")
+                except Exception:
+                    pass
+
+            time.sleep(cfg.delay)
+
+    home = outcomes.get("homepage (control)")
+    good = outcomes.get("KNOWN_GOOD_URL (control)")
+
+    print("\n" + "=" * 78)
+    if good == 200:
+        print("READING: real product pages LOAD in the browser. You are not")
+        print("         blocked. The 403s are invalid URL patterns -- my")
+        print("         placeholder-slug assumption was wrong. Fixable.")
+        result = 0
+    elif good is not None:
+        print(f"READING: a known-good product URL returned {good} even in a")
+        print("         browser holding a valid sensor cookie. Product pages")
+        print("         are genuinely protected against automation.")
+        result = 2
+    elif home == 200:
+        print("READING: homepage loads. Fill in KNOWN_GOOD_URL and re-run --")
+        print("         without it this test cannot distinguish the two cases.")
+        result = 1
+    else:
+        print(f"READING: even the homepage returned {home} in the browser.")
+        result = 2
+    print("=" * 78)
+    return result
+
+
+def playwright_run(
+    omsids: List[str], cfg: Config, cache: ResultCache, resume: bool
+) -> Dict[str, LookupResult]:
+    results: Dict[str, LookupResult] = {}
+    pending: List[str] = []
+
+    for omsid in omsids:
+        cached = cache.get(omsid) if resume else None
+        if cached and cached.status in TERMINAL_STATUSES:
+            results[omsid] = cached
+        else:
+            pending.append(omsid)
+
+    if resume and results:
+        print(f"Resuming: {len(results)} OMSIDs already resolved from cache.")
+    if not pending:
+        return results
+
+    total = len(pending)
+    estimate = total * (cfg.delay + 3.5) / 60.0
+    print(f"Checking {total} OMSIDs via browser. Estimated {estimate:.1f} minutes.")
+
+    consecutive_blocks = 0
+
+    with PlaywrightEngine(cfg, PROXY) as engine:
+        for index, omsid in enumerate(pending, start=1):
+            result = engine.lookup(omsid)
+            results[omsid] = result
+            cache.put(result)
+
+            if result.status == STATUS_BLOCKED:
+                consecutive_blocks += 1
+                if consecutive_blocks in (5, 15):
+                    print(f"  {consecutive_blocks} blocks in a row -- pausing 60s")
+                    time.sleep(60)
+                if consecutive_blocks >= 25:
+                    print("\n  Stopping: 25 consecutive blocks. Nothing is getting")
+                    print("  through, and continuing would only waste time.")
+                    break
+            else:
+                consecutive_blocks = 0
+
+            if index % 10 == 0 or index == total:
+                live = sum(1 for r in results.values() if r.status == STATUS_LIVE)
+                print(f"  {index}/{total} checked  ({live} live so far)")
+
+            time.sleep(cfg.delay + random.uniform(0, cfg.jitter))
+
+    cache.close()
+    return results
+
+
+def playwright_validate(cfg: Config) -> int:
+    print("=" * 78)
+    print("VALIDATION MODE -- browser engine")
+    print("=" * 78)
+
+    cleaned = [normalize_omsid(v) for v in VALIDATION_OMSIDS]
+    cleaned = [v for v in cleaned if v]
+    if not cleaned:
+        print("ERROR: no usable OMSID in VALIDATION_OMSIDS.")
+        return 1
+
+    live = 0
+    with PlaywrightEngine(cfg, PROXY) as engine:
+        for omsid in cleaned:
+            result = engine.lookup(omsid)
+            print(f"\nOMSID {omsid}")
+            print("-" * 46)
+            print(f"  status={result.status}   http={result.http_status}")
+            if result.url != NOT_APPLICABLE:
+                print(f"  url={result.url}")
+            if result.product_name:
+                print(f"  name={result.product_name[:80]}")
+            if result.note:
+                print(f"  note={result.note[:180]}")
+            if result.status == STATUS_LIVE:
+                live += 1
+            time.sleep(cfg.delay)
+
+    print("\n" + "=" * 78)
+    if live:
+        print(f"RESULT: WORKING. {live} of {len(cleaned)} resolved to live pages.")
+        print('        Set MODE = "test" and run again.')
+        print("=" * 78)
+        return 0
+
+    print("RESULT: no items resolved. If the status was BLOCKED, try setting")
+    print("        HEADLESS = False to watch what the browser actually sees.")
+    print("=" * 78)
+    return 2
+
+
+def playwright_main() -> int:
+    """Full pipeline using the browser engine: read Excel, check, write Excel."""
+    cfg = Config(
+        workers=1,
+        delay=max(0.0, DELAY_SECONDS),
+        verbose=True,
+    )
+
+    if MODE == "probe":
+        return playwright_probe(cfg)
+
+    if MODE == "validate":
+        return playwright_validate(cfg)
+
+    input_path = Path(INPUT_FILE)
+    if not input_path.exists():
+        print(f"ERROR: input file not found: {input_path.resolve()}", file=sys.stderr)
+        return 1
+
+    df, omsid_col = load_input(input_path, SHEET_NAME, OMSID_COLUMN)
+    print(f"Loaded {len(df)} rows from {input_path.name}; "
+          f"OMSID column = {omsid_col!r}")
+
+    unique: List[str] = []
+    seen = set()
+    for value in df["_omsid_norm"]:
+        if isinstance(value, str) and value and value not in seen:
+            seen.add(value)
+            unique.append(value)
+
+    invalid_rows = int(df["_omsid_norm"].isna().sum())
+    if invalid_rows:
+        print(f"  {invalid_rows} row(s) contain no usable OMSID; marked INVALID.")
+
+    if MODE == "test":
+        unique = unique[:TEST_LIMIT]
+        print(f"  Test mode: checking {len(unique)} OMSID(s).")
+
+    if not unique:
+        print("ERROR: no valid OMSIDs found in the input.", file=sys.stderr)
+        return 1
+
+    cache = ResultCache(Path(CACHE_FILE) if CACHE_FILE else None)
+    started = time.time()
+    results = playwright_run(unique, cfg, cache, bool(CACHE_FILE))
+    elapsed = time.time() - started
+
+    counts = write_output(
+        df, omsid_col, results, Path(OUTPUT_FILE), cfg, input_path
+    )
+
+    print("\n" + "-" * 60)
+    print(f"Finished in {elapsed / 60:.1f} minutes.")
+    for status in (STATUS_LIVE, STATUS_NOT_FOUND, STATUS_BLOCKED,
+                   STATUS_ERROR, STATUS_INVALID):
+        print(f"  {status:<11} {counts.get(status, 0)}")
+    print(f"\nWorkbook written to: {Path(OUTPUT_FILE).resolve()}")
+
+    unresolved = counts.get(STATUS_BLOCKED, 0) + counts.get(STATUS_ERROR, 0)
+    if unresolved:
+        print(f"\n{unresolved} row(s) got no definitive answer. Those are not")
+        print("confirmed-dead items. Run again to retry only those.")
+        return 3
+    return 0
+
+
+def run_from_settings() -> int:
+    """
+    Entry point driven by the SETTINGS block at the top of this file, so the
+    script can be run with a single click instead of from a command line.
+    """
+    cfg = Config(
+        workers=max(1, WORKERS),
+        delay=max(0.0, DELAY_SECONDS),
+        verbose=True,
+    )
+
+    if MODE == "network":
+        pool = SessionPool(None, cfg.timeout, verbose=False)
+        return network_check(cfg, pool)
+
+    if MODE == "sitemap_test":
+        pool = SessionPool(PROXY, cfg.timeout, verbose=True)
+        return sitemap_test(cfg, pool)
+
+    if MODE == "sitemap":
+        pool = SessionPool(PROXY, cfg.timeout, verbose=True)
+        return sitemap_main(cfg, pool)
+
+    if MODE == "audit":
+        pool = SessionPool(PROXY, cfg.timeout, verbose=True)
+        return sitemap_audit(cfg, pool)
+
+    if ENGINE == "playwright" and MODE in ("probe", "validate", "test", "full"):
+        return playwright_main()
+
+    if MODE == "probe":
+        pool = SessionPool(PROXY, cfg.timeout, verbose=True)
+        return probe(cfg, pool)
+
+    if MODE == "validate":
+        pool = SessionPool(PROXY, cfg.timeout, verbose=True)
+        cleaned = [normalize_omsid(v) or str(v) for v in VALIDATION_OMSIDS]
+        return validate(cleaned, cfg, pool)
+
+    if MODE not in ("test", "full"):
+        print(
+            f"ERROR: MODE must be 'network', 'validate', 'test', or 'full' "
+            f"-- got {MODE!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    args: List[str] = [
+        "-i", str(INPUT_FILE),
+        "-o", str(OUTPUT_FILE),
+        "--workers", str(WORKERS),
+        "--delay", str(DELAY_SECONDS),
+    ]
+    if SHEET_NAME:
+        args += ["--sheet", str(SHEET_NAME)]
+    if OMSID_COLUMN:
+        args += ["--column", str(OMSID_COLUMN)]
+    if CACHE_FILE:
+        args += ["--cache", str(CACHE_FILE), "--resume"]
+    if PROXY:
+        args += ["--proxy", str(PROXY)]
+    if MODE == "test":
+        args += ["--limit", str(TEST_LIMIT)]
+
+    return main(args)
+
+
+if __name__ == "__main__":
+    # Command-line flags win if any were supplied; otherwise fall back to the
+    # SETTINGS block above. This keeps both ways of running the script working.
+    if len(sys.argv) > 1:
+        sys.exit(main())
+    else:
+        sys.exit(run_from_settings())
