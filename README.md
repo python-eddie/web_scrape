@@ -22,6 +22,8 @@ N/A means "not in Home Depot's published list," which is almost always the same 
 The Needs Review tab is where those N/A rows land, with a search link so you can check them yourself.
 SITEMAP_REBUILD = True forces a fresh download. Set it to False and repeat runs use the cached copy and finish instantly.
 
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 Let me walk through one OMSID from start to finish: 206856244, your Hollywood bed frame.
 
 Step 1 — Read your Excel file
@@ -97,3 +99,33 @@ And that row also appears on the Needs Review tab, because "not in the list" is 
 The core idea in one sentence
 
 Home Depot publishes a list of every product URL, each URL ends in the OMSID, so the script downloads the list and looks your numbers up in it — a very large VLOOKUP, where the lookup table is downloaded from Home Depot rather than pasted into a sheet.
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Python was the right tool, and it is not a close call. Here is the reasoning, broken into the parts that actually decide it.
+
+1. Volume
+
+The working solution downloads roughly 169 sitemap files covering about 4.19 million product URLs, then matches your OMSIDs against that index. That is tens of megabytes of XML. I cannot hold that in a conversation. My context window is finite and would be exhausted long before the crawl finished, and every rerun would consume it again from scratch. A script holds it in memory or on disk at effectively zero cost.
+
+2. My own network access would have failed
+
+Two independent barriers. First, Home Depot's product pages sit behind Akamai Bot Manager, which blocked every direct-fetch approach we tried from your machine. My fetching tool is not exempt from that. Second, in the sandbox where I execute code, outbound network access is restricted to a fixed allowlist of package and code repositories. homedepot.com is not on it. So even if I wrote and ran the exact same script here, it would fail at the first request. The script has to run from your machine, on your residential connection, which is precisely what we established works.
+
+3. Repeatability
+
+This is a recurring merchandising check, not a one-time question. A script is a fixed artifact: you run it next month against a new input file and get the same logic applied the same way, with the sitemap cache reused so it finishes fast. Asking me each time means re-establishing the approach, re-verifying it, and accepting that my output could vary between runs. For anything that will be repeated, deterministic code beats a conversation.
+
+4. Auditability
+
+You can read the matching rule in the script and see exactly why an OMSID came back LIVE or NOT_FOUND. That matters here specifically, because we discovered the coverage gap — NOT_FOUND means "absent from published sitemaps," not "confirmed dead." That distinction is encoded in the code and in the Needs Review tab. If I did the matching conversationally, that caveat lives only in whatever I happened to say at the time.
+
+Where I was the right tool
+
+The design work. Diagnosing that the 403s were Akamai rather than a VPN or IP problem, ruling out requests, curl_cffi, and Playwright in sequence, identifying the sitemap pivot, catching that the sitemap index has imperfect coverage, and structuring the output workbook so the uncertain rows are isolated rather than silently reported as dead. That is judgment and diagnosis, and it is what a conversation is good for.
+
+The one case where you could have just asked me
+
+If the list were small — roughly twenty to thirty OMSIDs, one time only — asking me to check them individually via search would have been reasonable and faster than building anything. The break-even point is somewhere around there. Past it, the script wins immediately and keeps winning on every subsequent run.
+
+The correct division of labor is the one you used: I design and write, Python executes.
