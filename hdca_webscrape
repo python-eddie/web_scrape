@@ -1,0 +1,1307 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+homedepot_ca_checker.py
+=======================
+
+Home Depot CANADA companion to omsid_checker.py.
+
+Reads an Excel file containing Home Depot Canada product IDs, matches them
+against Home Depot Canada's published XML sitemaps, and writes an Excel
+workbook giving the live product URL or "N/A" for each item.
+
+WHY SITEMAPS
+------------
+Home Depot's interactive product pages sit behind Akamai Bot Manager and
+return 403 to automated clients. Their XML sitemaps do not: they exist so
+Google and Bing can crawl the catalogue, so they are served openly. Every
+Home Depot Canada product URL ends in the product ID, which means the sitemap
+files already contain both halves of what we need. Matching is then a local
+VLOOKUP against a large table rather than hundreds of blocked HTTP requests.
+
+CANADIAN URL SHAPES (verified)
+------------------------------
+    English : https://www.homedepot.ca/product/<slug>/<PRODUCT_ID>
+    French  : https://www.homedepot.ca/produit/<slug>/<PRODUCT_ID>
+
+CANADIAN SITEMAP FILES (verified)
+---------------------------------
+    https://www.homedepot.ca/sitemap_product_en.1.xml
+    https://www.homedepot.ca/sitemap_product_en.2.xml   ... and so on
+    https://www.homedepot.ca/sitemap_product_fr.1.xml   ... and so on
+
+These are flat, numbered files rather than the nested index tree used by
+homedepot.com. The script still tries robots.txt and the usual index paths
+first, and only falls back to enumerating the numbered files.
+
+IMPORTANT: CANADIAN IDS ARE NOT US OMSIDS
+-----------------------------------------
+A US OMSID (Internet #) is normally 9 digits, for example 206856244.
+A Home Depot Canada product ID is normally 10 digits beginning with 100,
+for example 1001015306. They are separate catalogues with separate numbering.
+Feeding US OMSIDs into this script will return NOT_FOUND for nearly every
+row. Set MODE = "diagnose" if you want the script to tell you which kind of
+IDs your input file actually contains before you run the full crawl.
+
+HOW TO RUN (PyCharm, no terminal needed)
+----------------------------------------
+    1. One time only, install the three dependencies. In PyCharm:
+       File > Settings > Project > Python Interpreter > "+" and add
+       pandas, openpyxl, requests.
+    2. Put your Excel file in the same folder as this script.
+    3. Edit INPUT_FILE below to match its name.
+    4. Leave MODE = "sitemap_test" and press Run. This confirms the
+       Canadian sitemaps are reachable from your machine. It takes well
+       under a minute.
+    5. If that succeeds, set MODE = "sitemap" and press Run again.
+
+MODES
+-----
+    "sitemap_test"  Connectivity check. Confirms the sitemaps respond and
+                    that product IDs parse out of the URLs. Downloads little.
+    "diagnose"      Reads your Excel file only. Reports the detected ID
+                    column, how the IDs are shaped, and whether they look
+                    Canadian or American. No network access at all.
+    "sitemap"       The real run. Builds the ID-to-URL index, matches your
+                    file, writes the output workbook.
+    "audit"         Same as "sitemap" but also prints every unmatched ID to
+                    the console for eyeballing.
+    "spotcheck"     Takes a few resolved URLs and requests them directly, to
+                    see whether product pages respond from your machine.
+                    Informational only. A 403 here does NOT mean the URL is
+                    wrong; it means Akamai blocked the request.
+
+Author's note: NOT_FOUND means "absent from Home Depot Canada's published
+sitemaps." That is strong evidence an item is not live, but sitemaps
+regenerate on a cycle, so a very recently listed item can be live on site and
+still missing here. That is why unmatched rows land on their own tab.
+"""
+
+from __future__ import annotations
+
+import gzip
+import json
+import re
+import sys
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+# ===========================================================================
+# CONFIGURATION - edit this block, then press Run
+# ===========================================================================
+
+INPUT_FILE = "Book11.xlsx"
+OUTPUT_FILE = "results_homedepot_ca.xlsx"
+
+MODE = "sitemap_test"
+
+# Which language's URLs to return.
+#   "en"   English URLs only            (/product/...)
+#   "fr"   French URLs only             (/produit/...)
+#   "both" English URL plus a second column holding the French URL
+LANGUAGE = "en"
+
+# Column in the Excel file holding the product IDs.
+# None means auto-detect. Set to a header name or a zero-based number to force it.
+ID_COLUMN: Optional[object] = None
+
+# Sheet to read. None means the first sheet.
+INPUT_SHEET: Optional[object] = None
+
+# The index is cached to disk so later runs are fast.
+SITEMAP_CACHE_FILE = "homedepot_ca_sitemap_index.json"
+SITEMAP_REBUILD = False          # True forces a fresh download
+
+# Keep only the IDs present in your input file. Uses far less memory and
+# lets the crawl stop early once every ID is accounted for.
+FILTER_TO_INPUT = True
+STOP_WHEN_ALL_FOUND = True
+
+# Safety caps on the crawl.
+SITEMAP_MAX_FILES = 300          # hard ceiling on product sitemap files
+ENUMERATION_MISS_TOLERANCE = 3   # consecutive 404s before enumeration stops
+
+# Network behaviour.
+#
+# Home Depot's Akamai layer inspects the TLS fingerprint and disconnects
+# clients that do not look like a browser, before sending any HTTP response.
+# curl_cffi presents a real Chrome fingerprint and is served normally, so it
+# is required here. Install it once in PyCharm:
+#   File > Settings > Project > Python Interpreter > "+" > curl_cffi
+HTTP_ENGINE = "auto"             # "auto", "curl_cffi", or "requests"
+IMPERSONATE_PROFILE = "chrome124"
+IMPERSONATE_FALLBACKS = ("chrome131", "chrome120", "chrome110", "chrome116")
+
+REQUEST_TIMEOUT = 60.0
+REQUEST_DELAY = 0.35             # polite pause between file downloads, seconds
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2.0
+
+# "spotcheck" mode only: how many resolved URLs to request directly.
+SPOTCHECK_COUNT = 3
+
+VERBOSE = True
+
+# ===========================================================================
+# END OF CONFIGURATION
+# ===========================================================================
+
+BASE = "https://www.homedepot.ca"
+ROBOTS_URL = f"{BASE}/robots.txt"
+
+CANDIDATE_INDEX_PATHS = (
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/sitemap-index.xml",
+    "/sitemap_index_en.xml",
+)
+
+PRODUCT_SITEMAP_TEMPLATE = BASE + "/sitemap_product_{lang}.{n}.xml"
+
+SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+# /product/<slug>/<id> or /produit/<slug>/<id>, with optional .html and slash.
+PRODUCT_URL_RE = re.compile(
+    r"/(?:product|produit)/[^/]+/(\d{6,12})(?:\.html)?/?$",
+    re.IGNORECASE,
+)
+# Lenient fallback: any homedepot.ca URL ending in a run of digits.
+LOOSE_ID_RE = re.compile(r"/(\d{6,12})(?:\.html)?/?$")
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
+STATUS_LIVE = "LIVE"
+STATUS_NOT_FOUND = "NOT_FOUND"
+STATUS_INVALID = "INVALID_ID"
+NOT_APPLICABLE = "N/A"
+
+# Header names that suggest an ID column, best guess first.
+ID_HEADER_HINTS = (
+    "canada product id", "ca product id", "product id", "productid",
+    "internet number", "internet #", "internet no", "internet",
+    "omsid", "oms id", "item id", "itemid", "item number", "item #",
+    "sku", "merchant sku", "product number", "id",
+)
+
+
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+def log(message: str = "") -> None:
+    if VERBOSE:
+        print(message, flush=True)
+
+
+def require(module_name: str, pip_name: Optional[str] = None):
+    """Import a third-party module with a readable failure message."""
+    try:
+        return __import__(module_name)
+    except ImportError:
+        pip_name = pip_name or module_name
+        print(
+            f"\nMissing dependency: {pip_name}\n"
+            f"In PyCharm go to File > Settings > Project > Python Interpreter, "
+            f"press '+', search for '{pip_name}', and install it.\n",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+def looks_gzipped(payload: bytes) -> bool:
+    return len(payload) >= 2 and payload[0] == 0x1F and payload[1] == 0x8B
+
+
+def decompress_if_needed(payload: bytes) -> bytes:
+    """Home Depot serves some sitemap files gzipped under an .xml name."""
+    if looks_gzipped(payload):
+        try:
+            return gzip.decompress(payload)
+        except OSError:
+            return payload
+    return payload
+
+
+def strip_bom(payload: bytes) -> bytes:
+    if payload.startswith(b"\xef\xbb\xbf"):
+        return payload[3:]
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# ID normalisation
+# ---------------------------------------------------------------------------
+
+def normalize_id(raw: object) -> Optional[str]:
+    """
+    Turn a spreadsheet cell into a clean digit string, or None if unusable.
+
+    Handles the usual Excel damage: floats such as 1001015306.0, values stored
+    as text with spaces or hyphens, and scientific notation.
+    """
+    if raw is None:
+        return None
+
+    if isinstance(raw, float):
+        if raw != raw:                       # NaN
+            return None
+        if raw.is_integer():
+            text = str(int(raw))
+        else:
+            text = repr(raw)
+    elif isinstance(raw, int):
+        text = str(raw)
+    else:
+        text = str(raw)
+
+    text = text.strip()
+    if not text or text.lower() in {"nan", "none", "n/a", "na", "-"}:
+        return None
+
+    # Scientific notation, for example 1.001015306E9
+    if "e" in text.lower() and any(ch.isdigit() for ch in text):
+        try:
+            as_float = float(text)
+            if as_float.is_integer():
+                text = str(int(as_float))
+        except ValueError:
+            pass
+
+    digits = re.sub(r"[^0-9]", "", text)
+    if not digits:
+        return None
+
+    digits = digits.lstrip("0") or "0"
+    if not (6 <= len(digits) <= 12):
+        return None
+    return digits
+
+
+def classify_id(clean_id: str) -> str:
+    """Best-effort guess at which catalogue an ID belongs to."""
+    if len(clean_id) == 10 and clean_id.startswith("100"):
+        return "CANADA"
+    if len(clean_id) == 9:
+        return "US_OMSID"
+    if len(clean_id) == 10:
+        return "CANADA_LIKELY"
+    return "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+def build_session():
+    """
+    Build the HTTP client.
+
+    Home Depot's Akamai configuration inspects the TLS fingerprint. A plain
+    Python client completes the handshake and is then disconnected before any
+    HTTP response is sent, which surfaces as RemoteDisconnected or a read
+    timeout rather than a status code. curl_cffi reproduces a real Chrome
+    fingerprint and is served normally. This was confirmed by diagnostic:
+    requests and urllib both failed, curl_cffi returned HTTP 200 in 0.13s.
+    """
+    engine = HTTP_ENGINE
+
+    if engine in ("auto", "curl_cffi"):
+        try:
+            from curl_cffi import requests as cffi_requests
+        except ImportError:
+            if engine == "curl_cffi":
+                print(
+                    "\nHTTP_ENGINE is set to 'curl_cffi' but the library is not "
+                    "installed.\nIn PyCharm: File > Settings > Project > Python "
+                    "Interpreter > '+' > curl_cffi\n",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+            log("  curl_cffi is not installed, falling back to requests")
+        else:
+            profiles = [IMPERSONATE_PROFILE] + [
+                p for p in IMPERSONATE_FALLBACKS if p != IMPERSONATE_PROFILE
+            ]
+
+            # curl_cffi accepts an unknown profile name at construction and
+            # only rejects it when a request is made, so validate up front
+            # against whatever this installed version actually supports.
+            try:
+                from curl_cffi.requests import BrowserType
+                supported = {entry.value for entry in BrowserType}
+            except Exception:                         # noqa: BLE001
+                supported = set()
+
+            if supported:
+                valid = [p for p in profiles if p in supported]
+                for skipped in (p for p in profiles if p not in supported):
+                    log(f"  impersonation profile {skipped!r} is not available "
+                        f"in this curl_cffi version, skipping")
+                if not valid:
+                    newest = sorted(
+                        (p for p in supported if p.startswith("chrome") and p[6:].isdigit()),
+                        key=lambda p: int(p[6:]),
+                    )
+                    valid = newest[-1:] or sorted(supported)[:1]
+                    if valid:
+                        log(f"  no configured profile is available, using {valid[0]!r}")
+                profiles = valid
+
+            last_error = None
+            for profile in profiles:
+                try:
+                    session = cffi_requests.Session(impersonate=profile)
+                    session.headers.update({
+                        "Accept": "application/xml,text/xml,text/plain,*/*",
+                        "Accept-Language": "en-CA,en;q=0.9,fr-CA;q=0.8",
+                    })
+                    session._hdca_engine = "curl_cffi"
+                    session._hdca_profile = profile
+                    log(f"  HTTP engine: curl_cffi, impersonating {profile}")
+                    return session
+                except Exception as exc:              # noqa: BLE001
+                    last_error = exc
+                    continue
+            log(f"  curl_cffi could not start ({last_error}), falling back to requests")
+
+    requests = require("requests")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "application/xml,text/xml,text/plain,*/*",
+        "Accept-Language": "en-CA,en;q=0.9,fr-CA;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    })
+    session._hdca_engine = "requests"
+    session._hdca_profile = None
+    log("  HTTP engine: requests (no TLS impersonation)")
+    return session
+
+
+def classify_exception(exc: Exception) -> str:
+    """Turn a transport exception into a short, readable note."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    if "timed out" in text or "timeout" in text or name.endswith("Timeout"):
+        return "timeout"
+    if "closed connection" in text or "remotedisconnected" in text:
+        return "connection closed by server (TLS fingerprint rejected?)"
+    if "connection" in text or name.endswith("ConnectionError"):
+        return f"connection error: {name}"
+    return f"{name}: {exc}"
+
+
+def fetch(session, url: str, timeout: float = REQUEST_TIMEOUT
+          ) -> Tuple[Optional[bytes], int, str]:
+    """
+    Fetch a URL with retries. Works with either HTTP engine.
+
+    Returns (payload_or_None, http_status, note). A payload is returned
+    already decompressed and BOM-stripped.
+    """
+    last_note = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = session.get(url, timeout=timeout, allow_redirects=True)
+            status = response.status_code
+            if status == 200:
+                payload = strip_bom(decompress_if_needed(response.content))
+                return payload, status, ""
+            if status in (404, 410):
+                return None, status, "not found"
+            if status in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF ** attempt
+                last_note = f"HTTP {status}, retrying in {wait:.0f}s"
+                log(f"      {last_note}")
+                time.sleep(wait)
+                continue
+            return None, status, f"HTTP {status}"
+        except Exception as exc:                      # noqa: BLE001
+            last_note = classify_exception(exc)
+
+        if attempt < MAX_RETRIES:
+            wait = RETRY_BACKOFF ** attempt
+            log(f"      {last_note}, retrying in {wait:.0f}s")
+            time.sleep(wait)
+
+    return None, 0, last_note or "failed"
+
+
+# ---------------------------------------------------------------------------
+# Sitemap parsing
+# ---------------------------------------------------------------------------
+
+def parse_sitemap(payload: bytes) -> Tuple[str, List[str]]:
+    """
+    Parse a sitemap document.
+
+    Returns (kind, locations) where kind is "index", "urlset", or "unknown".
+    Falls back to a regex sweep if the XML will not parse, which happens with
+    truncated or slightly malformed files.
+    """
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        locations = [
+            match.decode("utf-8", "replace")
+            for match in re.findall(rb"<loc>\s*([^<]+?)\s*</loc>", payload)
+        ]
+        return ("unknown", locations) if locations else ("unknown", [])
+
+    tag = root.tag.split("}")[-1].lower()
+    locations: List[str] = []
+    for element in root.iter():
+        if element.tag.split("}")[-1].lower() == "loc" and element.text:
+            locations.append(element.text.strip())
+
+    if tag == "sitemapindex":
+        return "index", locations
+    if tag == "urlset":
+        return "urlset", locations
+    return "unknown", locations
+
+
+def extract_product_id(url: str) -> Optional[str]:
+    match = PRODUCT_URL_RE.search(url)
+    if match:
+        return match.group(1).lstrip("0") or "0"
+    if "/product/" in url or "/produit/" in url:
+        loose = LOOSE_ID_RE.search(url)
+        if loose:
+            return loose.group(1).lstrip("0") or "0"
+    return None
+
+
+def is_product_url(url: str) -> bool:
+    return ("/product/" in url or "/produit/" in url) and extract_product_id(url) is not None
+
+
+def language_of(url: str) -> str:
+    return "fr" if "/produit/" in url.lower() else "en"
+
+
+# ---------------------------------------------------------------------------
+# Sitemap discovery
+# ---------------------------------------------------------------------------
+
+def sitemaps_from_robots(session) -> List[str]:
+    payload, status, note = fetch(session, ROBOTS_URL)
+    log(f"  robots.txt -> HTTP {status}{(' (' + note + ')') if note else ''}")
+    if not payload:
+        return []
+    text = payload.decode("utf-8", "replace")
+    found = re.findall(r"(?im)^\s*sitemap:\s*(\S+)\s*$", text)
+    for url in found:
+        log(f"    declared: {url}")
+    return found
+
+
+def expand_index(session, url: str, depth: int = 0, seen: Optional[Set[str]] = None
+                 ) -> List[str]:
+    """Walk a sitemap index down to the urlset files it points at."""
+    seen = seen if seen is not None else set()
+    if url in seen or depth > 3:
+        return []
+    seen.add(url)
+
+    payload, status, _ = fetch(session, url)
+    if not payload:
+        return []
+    kind, locations = parse_sitemap(payload)
+
+    if kind == "urlset":
+        return [url]
+
+    results: List[str] = []
+    for location in locations:
+        if not location.lower().endswith((".xml", ".xml.gz")):
+            continue
+        results.extend(expand_index(session, location, depth + 1, seen))
+        if len(results) >= SITEMAP_MAX_FILES:
+            break
+    return results
+
+
+def enumerate_product_sitemaps(session, languages: Sequence[str]) -> List[str]:
+    """
+    Fall back to the known numbered file pattern.
+
+    Verified to exist: sitemap_product_en.1.xml, sitemap_product_en.2.xml,
+    sitemap_product_fr.1.xml, sitemap_product_fr.15.xml, and
+    sitemap_product_fr.20.xml. The numbering starts at 1 and is contiguous,
+    so the scan walks upward until it sees several misses in a row.
+    """
+    discovered: List[str] = []
+    for lang in languages:
+        misses = 0
+        number = 1
+        log(f"  enumerating {lang} product sitemaps")
+        while number <= SITEMAP_MAX_FILES and misses < ENUMERATION_MISS_TOLERANCE:
+            url = PRODUCT_SITEMAP_TEMPLATE.format(lang=lang, n=number)
+            payload, status, _ = fetch(session, url)
+            if payload:
+                discovered.append(url)
+                misses = 0
+                log(f"    found {url.rsplit('/', 1)[-1]}  ({len(payload):,} bytes)")
+            else:
+                misses += 1
+                log(f"    miss  {url.rsplit('/', 1)[-1]}  (HTTP {status})")
+            number += 1
+            time.sleep(REQUEST_DELAY)
+    return discovered
+
+
+def languages_wanted() -> List[str]:
+    if LANGUAGE == "both":
+        return ["en", "fr"]
+    if LANGUAGE in ("en", "fr"):
+        return [LANGUAGE]
+    raise SystemExit(f'LANGUAGE must be "en", "fr", or "both", not {LANGUAGE!r}')
+
+
+def discover_product_sitemaps(session) -> List[str]:
+    """robots.txt, then candidate index paths, then numbered enumeration."""
+    langs = languages_wanted()
+    log("\nDiscovering Home Depot Canada sitemaps")
+
+    candidates: List[str] = []
+    for url in sitemaps_from_robots(session):
+        candidates.extend(expand_index(session, url))
+
+    if not candidates:
+        log("  robots.txt gave nothing usable, trying common index paths")
+        for path in CANDIDATE_INDEX_PATHS:
+            found = expand_index(session, BASE + path)
+            if found:
+                log(f"    {path} -> {len(found)} sitemap file(s)")
+                candidates.extend(found)
+                break
+            log(f"    {path} -> nothing")
+
+    product_files = [
+        url for url in candidates
+        if "product" in url.lower() or "produit" in url.lower()
+    ]
+    if product_files:
+        wanted = []
+        for url in product_files:
+            lowered = url.lower()
+            if any(f"_{lang}." in lowered or f"_{lang}/" in lowered for lang in langs):
+                wanted.append(url)
+        chosen = wanted or product_files
+        log(f"  index route produced {len(chosen)} product sitemap file(s)")
+        return chosen[:SITEMAP_MAX_FILES]
+
+    log("  falling back to the known numbered file pattern")
+    return enumerate_product_sitemaps(session, langs)
+
+
+# ---------------------------------------------------------------------------
+# Index building
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SitemapIndex:
+    en: Dict[str, str] = field(default_factory=dict)
+    fr: Dict[str, str] = field(default_factory=dict)
+    files_read: int = 0
+    urls_seen: int = 0
+    complete: bool = False          # unfiltered crawl that read every file
+    exhausted: bool = False         # the crawl reached the end of the file list
+    searched: Set[str] = field(default_factory=set)  # IDs this crawl looked for
+    language: str = "en"
+    built_at: str = ""
+
+    def get(self, product_id: str) -> Tuple[Optional[str], Optional[str]]:
+        return self.en.get(product_id), self.fr.get(product_id)
+
+    def known_ids(self) -> Set[str]:
+        return set(self.en) | set(self.fr)
+
+    def to_dict(self) -> dict:
+        return {
+            "version": 2,
+            "en": self.en,
+            "fr": self.fr,
+            "files_read": self.files_read,
+            "urls_seen": self.urls_seen,
+            "complete": self.complete,
+            "exhausted": self.exhausted,
+            "searched": sorted(self.searched),
+            "language": self.language,
+            "built_at": self.built_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SitemapIndex":
+        return cls(
+            en=dict(data.get("en", {})),
+            fr=dict(data.get("fr", {})),
+            files_read=int(data.get("files_read", 0)),
+            urls_seen=int(data.get("urls_seen", 0)),
+            complete=bool(data.get("complete", False)),
+            exhausted=bool(data.get("exhausted", False)),
+            searched=set(data.get("searched", [])),
+            language=str(data.get("language", "en")),
+            built_at=str(data.get("built_at", "")),
+        )
+
+
+def load_cached_index(path: Path) -> Optional[SitemapIndex]:
+    if SITEMAP_REBUILD or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        index = SitemapIndex.from_dict(data)
+        log(f"\nLoaded cached index: {len(index.known_ids()):,} product IDs "
+            f"(built {index.built_at or 'unknown'}, "
+            f"{'complete crawl' if index.complete else 'partial crawl'})")
+        return index
+    except Exception as exc:                          # noqa: BLE001
+        log(f"  cache unreadable ({type(exc).__name__}), rebuilding")
+        return None
+
+
+def cache_is_usable(index: SitemapIndex, wanted: Set[str]) -> bool:
+    """
+    Decide whether a cached index can answer this input without re-crawling.
+
+    Three cases count as an answer:
+      1. The crawl was unfiltered and read every file, so it covers everything.
+      2. Every wanted ID was matched, so nothing is left to look for.
+      3. The crawl read every file while looking for a superset of these IDs.
+         Anything it did not match is a confirmed absence, not a crawl artefact.
+
+    Case 3 matters in practice: without it, a single genuinely dead item would
+    force a full re-crawl on every run.
+    """
+    if index.language != LANGUAGE:
+        log(f"  cached index was built for LANGUAGE={index.language!r}, rebuilding")
+        return False
+    if index.complete:
+        return True
+    if not (wanted - index.known_ids()):
+        return True
+    if index.exhausted and not (wanted - index.searched):
+        log("  cached index read every sitemap file for these IDs, "
+            "so unmatched ones are confirmed absent")
+        return True
+
+    unexplained = wanted - index.known_ids() - (
+        index.searched if index.exhausted else set()
+    )
+    log(f"  cached index cannot account for {len(unexplained):,} of your IDs, rebuilding")
+    return False
+
+
+def build_index(session, wanted: Optional[Set[str]]) -> SitemapIndex:
+    index = SitemapIndex(
+        built_at=datetime.now().isoformat(timespec="seconds"),
+        searched=set(wanted) if wanted else set(),
+        language=LANGUAGE,
+    )
+    files = discover_product_sitemaps(session)
+
+    if not files:
+        log("\nNo product sitemap files could be reached. Nothing to match against.")
+        return index
+
+    log(f"\nReading {len(files)} product sitemap file(s)")
+    target = len(wanted) if wanted else None
+    stopped_early = False
+
+    for position, url in enumerate(files, start=1):
+        payload, status, note = fetch(session, url)
+        if not payload:
+            log(f"  [{position}/{len(files)}] {url.rsplit('/', 1)[-1]} -> "
+                f"HTTP {status} {note}, skipped")
+            continue
+
+        kind, locations = parse_sitemap(payload)
+        index.files_read += 1
+        matched_here = 0
+
+        for location in locations:
+            product_id = extract_product_id(location)
+            if not product_id:
+                continue
+            index.urls_seen += 1
+            if wanted is not None and product_id not in wanted:
+                continue
+            if language_of(location) == "fr":
+                index.fr.setdefault(product_id, location)
+            else:
+                index.en.setdefault(product_id, location)
+            matched_here += 1
+
+        found_total = len(index.known_ids())
+        progress = f" | {found_total:,}/{target:,} matched" if target else ""
+        log(f"  [{position}/{len(files)}] {url.rsplit('/', 1)[-1]} -> {kind}, "
+            f"{len(locations):,} locs, {matched_here:,} kept{progress}")
+
+        if (wanted is not None and STOP_WHEN_ALL_FOUND
+                and target and found_total >= target):
+            log("  every requested ID has been located, stopping early")
+            stopped_early = True
+            break
+
+        time.sleep(REQUEST_DELAY)
+
+    index.exhausted = not stopped_early
+    index.complete = (wanted is None) and index.exhausted
+    return index
+
+
+def save_index(index: SitemapIndex, path: Path) -> None:
+    try:
+        path.write_text(json.dumps(index.to_dict()), encoding="utf-8")
+        log(f"\nIndex cached to {path.resolve()}")
+    except Exception as exc:                          # noqa: BLE001
+        log(f"\nCould not write cache ({type(exc).__name__}: {exc}). Continuing.")
+
+
+# ---------------------------------------------------------------------------
+# Excel input
+# ---------------------------------------------------------------------------
+
+def read_input(path: Path):
+    pandas = require("pandas")
+    require("openpyxl")
+
+    if not path.exists():
+        raise SystemExit(
+            f"\nInput file not found: {path.resolve()}\n"
+            f"Put the workbook in the same folder as this script, or change "
+            f"INPUT_FILE at the top."
+        )
+
+    sheet = 0 if INPUT_SHEET is None else INPUT_SHEET
+    frame = pandas.read_excel(path, sheet_name=sheet, dtype=object)
+    if frame.empty:
+        raise SystemExit(f"\n{path.name} has no rows.")
+    return frame
+
+
+def detect_id_column(frame) -> str:
+    """Pick the column holding the product IDs."""
+    if ID_COLUMN is not None:
+        if isinstance(ID_COLUMN, int):
+            return str(frame.columns[ID_COLUMN])
+        if ID_COLUMN in frame.columns:
+            return str(ID_COLUMN)
+        raise SystemExit(
+            f"\nID_COLUMN {ID_COLUMN!r} is not in the file. "
+            f"Columns present: {list(frame.columns)}"
+        )
+
+    headers = {str(col).strip().lower(): str(col) for col in frame.columns}
+    for hint in ID_HEADER_HINTS:
+        for lowered, original in headers.items():
+            if lowered == hint:
+                return original
+    for hint in ID_HEADER_HINTS:
+        for lowered, original in headers.items():
+            if hint in lowered:
+                return original
+
+    # No helpful header. Score each column by how many cells normalise cleanly.
+    best_column, best_score = None, 0.0
+    for column in frame.columns:
+        values = frame[column].tolist()
+        usable = sum(1 for value in values if normalize_id(value))
+        score = usable / max(len(values), 1)
+        if score > best_score:
+            best_column, best_score = column, score
+
+    if best_column is None or best_score < 0.5:
+        raise SystemExit(
+            f"\nCould not identify the product ID column.\n"
+            f"Columns present: {list(frame.columns)}\n"
+            f"Set ID_COLUMN at the top of the script to the correct header."
+        )
+    return str(best_column)
+
+
+def collect_ids(frame, column: str) -> Tuple[List[Optional[str]], Set[str]]:
+    per_row = [normalize_id(value) for value in frame[column].tolist()]
+    unique = {value for value in per_row if value}
+    return per_row, unique
+
+
+# ---------------------------------------------------------------------------
+# Excel output
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RowResult:
+    raw: object
+    clean_id: Optional[str]
+    status: str
+    url_en: str = NOT_APPLICABLE
+    url_fr: str = NOT_APPLICABLE
+    note: str = ""
+
+
+def write_output(frame, column: str, results: List[RowResult],
+                 out_path: Path, meta: dict) -> Dict[str, int]:
+    openpyxl = require("openpyxl")
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="F96302")   # Home Depot orange
+    body_font = Font(name="Arial", size=10)
+    link_font = Font(name="Arial", size=10, color="0563C1", underline="single")
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    status_fills = {
+        STATUS_LIVE: PatternFill("solid", fgColor="E2EFDA"),
+        STATUS_NOT_FOUND: PatternFill("solid", fgColor="FCE4D6"),
+        STATUS_INVALID: PatternFill("solid", fgColor="F2F2F2"),
+    }
+
+    workbook = openpyxl.Workbook()
+
+    # ---------------- Results ----------------
+    sheet = workbook.active
+    sheet.title = "Results"
+
+    source_columns = [str(col) for col in frame.columns]
+    added = ["Status", "URL (EN)"]
+    if LANGUAGE in ("fr", "both"):
+        added.append("URL (FR)")
+    added += ["Clean ID", "Note", "Checked At"]
+    headers = source_columns + added
+
+    for position, name in enumerate(headers, start=1):
+        cell = sheet.cell(row=1, column=position, value=name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    checked_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    counts: Dict[str, int] = {}
+
+    for offset, result in enumerate(results):
+        row = offset + 2
+        counts[result.status] = counts.get(result.status, 0) + 1
+
+        for position, source in enumerate(source_columns, start=1):
+            value = frame.iloc[offset][source]
+            if value != value:                        # NaN
+                value = None
+            cell = sheet.cell(row=row, column=position, value=value)
+            cell.font = body_font
+            cell.border = border
+
+        cursor = len(source_columns) + 1
+
+        status_cell = sheet.cell(row=row, column=cursor, value=result.status)
+        status_cell.font = Font(name="Arial", size=10, bold=True)
+        status_cell.fill = status_fills.get(result.status, status_fills[STATUS_INVALID])
+        status_cell.border = border
+        status_cell.alignment = Alignment(horizontal="center")
+        cursor += 1
+
+        for url in ([result.url_en, result.url_fr]
+                    if LANGUAGE in ("fr", "both") else [result.url_en]):
+            cell = sheet.cell(row=row, column=cursor, value=url)
+            if url and url != NOT_APPLICABLE:
+                cell.hyperlink = url
+                cell.font = link_font
+            else:
+                cell.font = body_font
+            cell.border = border
+            cursor += 1
+
+        for value in (result.clean_id or NOT_APPLICABLE, result.note, checked_at):
+            cell = sheet.cell(row=row, column=cursor, value=value)
+            cell.font = body_font
+            cell.border = border
+            cursor += 1
+
+    widths = {"Status": 12, "URL (EN)": 72, "URL (FR)": 72,
+              "Clean ID": 14, "Note": 46, "Checked At": 17}
+    for position, name in enumerate(headers, start=1):
+        letter = get_column_letter(position)
+        sheet.column_dimensions[letter].width = widths.get(name, 20)
+
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(results) + 1}"
+
+    # ---------------- Needs Review ----------------
+    review = workbook.create_sheet("Needs Review")
+    review_headers = ["Row in source", "ID as supplied", "Clean ID",
+                      "Status", "Note", "Search Home Depot Canada"]
+    for position, name in enumerate(review_headers, start=1):
+        cell = review.cell(row=1, column=position, value=name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    review_row = 2
+    for offset, result in enumerate(results):
+        if result.status == STATUS_LIVE:
+            continue
+        search_url = (
+            f"{BASE}/search?q={result.clean_id}"
+            if result.clean_id else f"{BASE}/en/home.html"
+        )
+        values = [
+            offset + 2,
+            result.raw if result.raw == result.raw else None,
+            result.clean_id or NOT_APPLICABLE,
+            result.status,
+            result.note,
+            search_url,
+        ]
+        for position, value in enumerate(values, start=1):
+            cell = review.cell(row=review_row, column=position, value=value)
+            cell.font = body_font
+            cell.border = border
+        link_cell = review.cell(row=review_row, column=len(values))
+        link_cell.hyperlink = search_url
+        link_cell.font = link_font
+        review_row += 1
+
+    for position, width in enumerate([14, 20, 14, 13, 46, 60], start=1):
+        review.column_dimensions[get_column_letter(position)].width = width
+    review.freeze_panes = "A2"
+    if review_row > 2:
+        review.auto_filter.ref = f"A1:F{review_row - 1}"
+
+    # ---------------- Run Info ----------------
+    info = workbook.create_sheet("Run Info")
+    info_rows = [
+        ("Run at", checked_at),
+        ("Source file", meta.get("input_file", "")),
+        ("Sheet", str(meta.get("sheet", "first"))),
+        ("ID column detected", meta.get("id_column", "")),
+        ("Language", LANGUAGE),
+        ("Rows in file", meta.get("row_count", 0)),
+        ("Unique IDs", meta.get("unique_ids", 0)),
+        ("Sitemap files read", meta.get("files_read", 0)),
+        ("Product URLs scanned", meta.get("urls_seen", 0)),
+        ("Index cache", meta.get("cache_file", "")),
+        ("HTTP engine", meta.get("http_engine", "")),
+        ("Read every sitemap file",
+         "Yes" if meta.get("exhausted") else "No, the crawl stopped early once "
+         "every requested ID was located"),
+        ("Full catalogue indexed",
+         "Yes" if meta.get("complete") else "No, only the IDs from this file "
+         "were retained (FILTER_TO_INPUT is on)"),
+        ("", ""),
+        ("LIVE", counts.get(STATUS_LIVE, 0)),
+        ("NOT_FOUND", counts.get(STATUS_NOT_FOUND, 0)),
+        ("INVALID_ID", counts.get(STATUS_INVALID, 0)),
+        ("", ""),
+        ("What NOT_FOUND means",
+         "The ID is absent from Home Depot Canada's published sitemaps. That is "
+         "strong evidence the item is not live, but sitemaps regenerate on a "
+         "cycle, so a very recently listed item can be live and still missing "
+         "here. Spot-check these in a browser before acting on them."),
+        ("What INVALID_ID means",
+         "The cell could not be read as a product ID at all: blank, text, or "
+         "the wrong number of digits."),
+        ("Canadian versus US IDs",
+         "Home Depot Canada product IDs are normally 10 digits beginning 100, "
+         "for example 1001015306. US OMSIDs are normally 9 digits. The two "
+         "catalogues do not share numbering."),
+    ]
+    for position, (label, value) in enumerate(info_rows, start=1):
+        label_cell = info.cell(row=position, column=1, value=label)
+        label_cell.font = Font(name="Arial", size=10, bold=True)
+        value_cell = info.cell(row=position, column=2, value=value)
+        value_cell.font = body_font
+        value_cell.alignment = Alignment(wrap_text=True, vertical="top")
+    info.column_dimensions["A"].width = 26
+    info.column_dimensions["B"].width = 95
+
+    workbook.save(out_path)
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
+
+def mode_diagnose() -> int:
+    """Inspect the input file only. No network access."""
+    path = Path(INPUT_FILE)
+    frame = read_input(path)
+    column = detect_id_column(frame)
+    per_row, unique = collect_ids(frame, column)
+
+    log(f"\nFile      : {path.resolve()}")
+    log(f"Rows      : {len(frame):,}")
+    log(f"Columns   : {list(frame.columns)}")
+    log(f"ID column : {column!r}")
+    log(f"Readable  : {sum(1 for value in per_row if value):,} of {len(per_row):,}")
+    log(f"Unique    : {len(unique):,}")
+
+    kinds: Dict[str, int] = {}
+    for value in unique:
+        kind = classify_id(value)
+        kinds[kind] = kinds.get(kind, 0) + 1
+
+    log("\nID shape breakdown")
+    for kind, count in sorted(kinds.items(), key=lambda item: -item[1]):
+        share = 100.0 * count / max(len(unique), 1)
+        log(f"  {kind:<14} {count:>7,}  ({share:5.1f}%)")
+
+    sample = sorted(unique)[:8]
+    log(f"\nSample IDs: {', '.join(sample) if sample else 'none'}")
+
+    us_share = kinds.get("US_OMSID", 0) / max(len(unique), 1)
+    if us_share > 0.5:
+        log(
+            "\nWARNING: most of these look like US OMSIDs, which are 9 digits.\n"
+            "Home Depot Canada uses a separate 10-digit catalogue. Running the\n"
+            "Canadian match against US numbers will return NOT_FOUND for almost\n"
+            "every row. Confirm you are working from Canadian item IDs first."
+        )
+    else:
+        log("\nThese look consistent with Home Depot Canada product IDs.")
+    return 0
+
+
+def mode_sitemap_test() -> int:
+    """Confirm the Canadian sitemaps are reachable and parse correctly."""
+    session = build_session()
+    log("Testing reachability of Home Depot Canada's sitemaps")
+
+    files = discover_product_sitemaps(session)
+    if not files:
+        engine = getattr(session, "_hdca_engine", "unknown")
+        log(
+            f"\nFAILED. No product sitemap files responded. HTTP engine: {engine}.\n"
+        )
+        if engine != "curl_cffi":
+            log(
+                "You are not using TLS impersonation. Home Depot's Akamai layer\n"
+                "closes plain Python connections without sending a response, which\n"
+                "looks like a timeout rather than a block. Install curl_cffi:\n"
+                "  File > Settings > Project > Python Interpreter > '+' > curl_cffi\n"
+                "then run this again."
+            )
+        else:
+            log(
+                "curl_cffi is active, so the fingerprint is not the issue. Try a\n"
+                "different IMPERSONATE_PROFILE from IMPERSONATE_FALLBACKS, and\n"
+                "confirm https://www.homedepot.ca/robots.txt still loads in Chrome\n"
+                "on this machine."
+            )
+        return 2
+
+    log(f"\nDiscovered {len(files)} product sitemap file(s). Sampling the first one.")
+    payload, status, note = fetch(session, files[0])
+    if not payload:
+        log(f"  first file returned HTTP {status} {note}")
+        return 2
+
+    kind, locations = parse_sitemap(payload)
+    products = [url for url in locations if is_product_url(url)]
+    log(f"  {files[0]}")
+    log(f"  -> {kind}, {len(locations):,} locations, {len(products):,} product URLs")
+
+    if not products:
+        log("\nThe file parsed but held no product URLs. Send me this output.")
+        return 2
+
+    log("\nSample product URLs and the IDs parsed from them:")
+    for url in products[:5]:
+        log(f"  {extract_product_id(url):<12} {url}")
+
+    log(
+        f"\nSUCCESS. Set MODE = \"sitemap\" and press Run again.\n"
+        f"Estimated catalogue coverage: roughly {len(products):,} products per "
+        f"file across {len(files)} files."
+    )
+    return 0
+
+
+def run_match(audit: bool = False) -> int:
+    path = Path(INPUT_FILE)
+    frame = read_input(path)
+    column = detect_id_column(frame)
+    per_row, unique = collect_ids(frame, column)
+
+    log(f"\nInput      : {path.resolve()}")
+    log(f"ID column  : {column!r}")
+    log(f"Rows       : {len(frame):,}")
+    log(f"Unique IDs : {len(unique):,}")
+
+    if not unique:
+        log("\nNo readable product IDs. Run MODE = \"diagnose\" to see why.")
+        return 1
+
+    canadian = sum(1 for value in unique
+                   if classify_id(value) in ("CANADA", "CANADA_LIKELY"))
+    if canadian / len(unique) < 0.5:
+        log(
+            "\nWARNING: fewer than half of these IDs look Canadian. Home Depot\n"
+            "Canada uses 10-digit IDs beginning 100. Continuing anyway, but\n"
+            "expect a high NOT_FOUND count if these are US OMSIDs."
+        )
+
+    cache_path = Path(SITEMAP_CACHE_FILE)
+    wanted: Optional[Set[str]] = unique if FILTER_TO_INPUT else None
+
+    engine_used = "cached index, no requests made"
+    index = load_cached_index(cache_path)
+    if index is None or not cache_is_usable(index, unique):
+        session = build_session()
+        engine_used = getattr(session, "_hdca_engine", "unknown")
+        profile = getattr(session, "_hdca_profile", None)
+        if profile:
+            engine_used = f"{engine_used} ({profile})"
+        index = build_index(session, wanted)
+        if not index.known_ids() and index.files_read == 0:
+            log("\nNo sitemap data was retrieved. Run MODE = \"sitemap_test\" first.")
+            return 2
+        save_index(index, cache_path)
+
+    results: List[RowResult] = []
+    for offset, clean_id in enumerate(per_row):
+        raw = frame.iloc[offset][column]
+        if not clean_id:
+            results.append(RowResult(
+                raw=raw, clean_id=None, status=STATUS_INVALID,
+                note="cell could not be read as a product ID",
+            ))
+            continue
+
+        url_en, url_fr = index.get(clean_id)
+        primary = url_en if LANGUAGE != "fr" else url_fr
+        secondary = url_fr
+
+        if primary or (LANGUAGE == "both" and secondary):
+            results.append(RowResult(
+                raw=raw, clean_id=clean_id, status=STATUS_LIVE,
+                url_en=url_en or NOT_APPLICABLE,
+                url_fr=url_fr or NOT_APPLICABLE,
+                note="" if primary else "only the other language was published",
+            ))
+        else:
+            note = "not present in Home Depot Canada's published sitemaps"
+            if classify_id(clean_id) == "US_OMSID":
+                note += "; this looks like a US OMSID, not a Canadian ID"
+            results.append(RowResult(
+                raw=raw, clean_id=clean_id, status=STATUS_NOT_FOUND, note=note,
+            ))
+
+    meta = {
+        "input_file": str(path.resolve()),
+        "sheet": "first sheet" if INPUT_SHEET is None else INPUT_SHEET,
+        "id_column": column,
+        "row_count": len(frame),
+        "unique_ids": len(unique),
+        "files_read": index.files_read,
+        "urls_seen": index.urls_seen,
+        "cache_file": str(cache_path.resolve()),
+        "http_engine": engine_used,
+        "complete": index.complete,
+        "exhausted": index.exhausted,
+    }
+
+    out_path = Path(OUTPUT_FILE)
+    counts = write_output(frame, column, results, out_path, meta)
+
+    log("\n" + "-" * 62)
+    for status in (STATUS_LIVE, STATUS_NOT_FOUND, STATUS_INVALID):
+        log(f"  {status:<12} {counts.get(status, 0):>7,}")
+    log("-" * 62)
+    log(f"\nWorkbook written to: {out_path.resolve()}")
+
+    if audit:
+        unmatched = sorted({r.clean_id for r in results
+                            if r.status == STATUS_NOT_FOUND and r.clean_id})
+        log(f"\nAudit: {len(unmatched):,} unmatched ID(s)")
+        for value in unmatched:
+            log(f"  {value}  ->  {BASE}/search?q={value}")
+
+    log(
+        "\nNOT_FOUND means the ID is absent from Home Depot Canada's published\n"
+        "sitemaps. That is strong evidence the item is not live, but sitemaps\n"
+        "regenerate on a cycle, so spot-check a few before acting on them.\n"
+        "The Needs Review tab has clickable search links for exactly that."
+    )
+    return 0
+
+
+def mode_spotcheck() -> int:
+    """Request a few resolved product URLs directly. Informational only."""
+    cache_path = Path(SITEMAP_CACHE_FILE)
+    index = load_cached_index(cache_path)
+    if index is None:
+        log("\nNo cached index. Run MODE = \"sitemap\" first.")
+        return 1
+
+    urls = list(index.en.values())[:SPOTCHECK_COUNT] or \
+           list(index.fr.values())[:SPOTCHECK_COUNT]
+    if not urls:
+        log("\nThe cached index holds no URLs.")
+        return 1
+
+    session = build_session()
+    session.headers["Accept"] = (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    )
+
+    log("\nRequesting product pages directly. This is a bot-defence probe,")
+    log("not a correctness check. A 403 does not mean the URL is wrong.\n")
+    for url in urls:
+        payload, status, note = fetch(session, url, timeout=30.0)
+        size = len(payload) if payload else 0
+        log(f"  HTTP {status:<4} {size:>8,} bytes  {url}")
+        time.sleep(REQUEST_DELAY)
+
+    log(
+        "\nIf these returned 403, that is expected and harmless. The sitemap\n"
+        "route does not depend on product pages being fetchable."
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    log("=" * 62)
+    log("  Home Depot Canada product ID checker")
+    log(f"  MODE = {MODE!r}   LANGUAGE = {LANGUAGE!r}")
+    log("=" * 62)
+
+    dispatch = {
+        "diagnose": mode_diagnose,
+        "sitemap_test": mode_sitemap_test,
+        "sitemap": lambda: run_match(audit=False),
+        "audit": lambda: run_match(audit=True),
+        "spotcheck": mode_spotcheck,
+    }
+
+    handler = dispatch.get(MODE)
+    if handler is None:
+        log(f"\nUnknown MODE {MODE!r}. Valid values: {', '.join(sorted(dispatch))}")
+        return 1
+    return handler()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        raise SystemExit(130)
