@@ -97,7 +97,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 INPUT_FILE = "Book11.xlsx"
 OUTPUT_FILE = "results_homedepot_ca.xlsx"
 
-MODE = "sitemap_test"
+MODE = "sitemap"
 
 # Which language's URLs to return.
 #   "en"   English URLs only            (/product/...)
