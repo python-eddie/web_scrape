@@ -1,0 +1,681 @@
+"""
+target_live_checker.py
+
+Checks whether Target TCINs resolve to a live product page on target.com.
+Built on the same approach as omsid_checker.py (Home Depot).
+
+MODES
+-----
+"sitemap"   Downloads Target's published product sitemap
+            (https://www.target.com/sitemap_pdp-index.xml.gz, listed in
+            target.com/robots.txt), builds a {tcin: url} index, and looks each
+            TCIN up. No product page is requested. The index is cached to disk.
+
+"api"       Queries Target's RedSky product API (the JSON endpoint the
+            target.com product page itself calls), one request per TCIN, with
+            a product-page fallback when the API is inconclusive.
+
+"combined"  (default) Sitemap first. Every TCIN NOT found in the sitemap is
+            then checked with "api". This matters because Target's sitemap may
+            list only the variation parent (VAP) page and not every variation
+            child TCIN, so a sitemap miss alone does not prove an item is down.
+
+STATUS VALUES
+-------------
+LIVE        Resolves to a published product page.
+NOT_FOUND   Target reports no product for the TCIN (or not in sitemap, in
+            sitemap-only mode).
+UNKNOWN     No definitive answer (blocked, rate limited, errors).
+
+SAME LIMITATION AS THE HD SCRIPT: LIVE means the TCIN resolves to a URL. It
+does not mean the item is in stock or purchasable. Sitemaps commonly retain
+retired pages. API-mode rows include price and an all-stores out-of-stock flag
+where Target supplies them; use those for a purchasability read.
+
+SETUP (PyCharm Terminal)
+------------------------
+    pip install requests pandas openpyxl
+
+OUTPUT
+------
+An Excel workbook, target_live_check_<timestamp>.xlsx, saved in the same
+folder as this script (or OUTPUT_FOLDER), and opened automatically.
+  Results  one row per TCIN in input order; clickable URLs; color-coded status.
+  Summary  counts by status, and by status + method.
+"""
+
+import gzip
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+import pandas as pd
+import requests
+
+# ==========================================================================
+# CONFIGURATION
+# ==========================================================================
+
+MODE = "combined"            # "sitemap", "api", or "combined"
+
+# --- Excel output ---
+# Folder for the results workbook. None = the same folder as this script.
+# Example: OUTPUT_FOLDER = r"C:\Users\Eddie\Documents\Target Checks"
+OUTPUT_FOLDER = None
+OUTPUT_FILE_PREFIX = "target_live_check"
+OPEN_EXCEL_WHEN_DONE = True  # Opens the workbook automatically after the run.
+
+# --- Sitemap settings ---
+SITEMAP_INDEX_URL = "https://www.target.com/sitemap_pdp-index.xml.gz"
+SITEMAP_INDEX_FILE = "target_sitemap_index.json"   # on-disk cache
+SITEMAP_REBUILD = True       # True forces a fresh download
+# True: index only your input TCINs and stop once all are found (fast, small).
+# False: index every product URL in the sitemap (slow, large).
+SITEMAP_FILTER_TO_INPUT = True
+SITEMAP_MAX_FILES = 2000     # cap on child sitemap files downloaded
+
+# --- API settings ---
+# Public key the target.com front end sends to RedSky. If Target rotates it,
+# the script tries to read the current key from the homepage automatically.
+API_KEY = "9f36aeafbe60771e321a7cc95a78140772ab3e96"
+PDP_API_URL = "https://redsky.target.com/redsky_aggregations/v1/web/pdp_client_v1"
+PDP_PAGE_URL = "https://www.target.com/p/-/A-{tcin}"
+STORE_ID = "3991"            # Any valid store; affects price/fulfillment fields only.
+MAX_WORKERS = 4              # Lower to 2 if you see many HTTP 429 notes.
+MAX_RETRIES = 3
+TIMEOUT = 30
+DELAY_RANGE = (0.4, 1.2)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.target.com",
+    "Referer": "https://www.target.com/",
+}
+PAGE_HEADERS = {
+    **HEADERS,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# Target PDP URLs end in /-/A-<TCIN>, e.g.
+#   https://www.target.com/p/some-product-name/-/A-12345678
+TCIN_URL_RE = re.compile(r"/A-(\d{6,10})(?:[/?#]|$)")
+
+TCINS_RAW = """
+84262355 84262350 84262341 84262331 84262327 84262344 84262348 84262322 84262319
+81202082 81202083 81202084 81202085 81202097 81202098 81202096 81202094 81202099
+81202101 81202095 84156024 86882872 84156028 84156029 86882873 86882871 81885808
+81885811 81885818 81885816 81885815 81885800 86302792 88179201 88708185 88708181
+84156026 88708184 88179225 84262347 88179157 86302820 86302807 81785102 88179130
+84156023 84262320 88708183 81785098 88708182 86302815 88179192 81785097 81785103
+81785100 81785106 86302810 81785101 81785099 84156025 84262376 86302822 88179213
+84262334 87045700 87045713 88179179 88179139 88179204 87608288 87608302 87045692
+88179269 87608295 87608246 88179273 88179185 87608318 87045721 88179133 87045708
+88179290 88179287 87045736 87608309 87608315 88179193 88179294 87608276 88179296
+88179118 87045688 88179211 88179267 88179219 88179202 87608258 88179190 87608310
+87608289 87045679 87045707 87045740 87608297 87045709 88179138 87045725 87045681
+88179181 88179137 88179128 87608307 87045685 88179111 87045715 87045712 88179172
+88179127 87608319 88179132 87045730 88179286 87045703 88179142 88179135 88179143
+88179195 87045672 87045720 87608269 88179209 87608260 88179151 88179134 87045683
+88179198 87608254 83784051 83784034 83784060 83784059 83784055 83784052 83784071
+83784053 83784069 83784044 83784082 83784048 81885812 81885817 81885813 81885802
+81885810 81885809 87608264 87608287 83784039 87608259 83784087 83784078 87608290
+87608234 83784077 87608232 87608245 87608231 87608239 88179156 88179147 88179246
+88179237 88179236 88179279 88179257 88179158 88179261 88179221 88179154 88179161
+88179238 88179227 87045674 87608272 87045697 87045696 87608241 87045727 87045710
+87045699 87045717 87045694 87608256 88179232 87045669 81885806 82083882 81885819
+88179226 82083881 88179218 87045723 87045735 82664089 82664087 87045732 87045684
+82664078 82664079 82664077 82083876 82083879 82083883 82083877 82664092 87045739
+"""
+
+# ==========================================================================
+# GENERAL HELPERS
+# ==========================================================================
+
+def parse_tcins(raw: str) -> list[str]:
+    """Extract TCINs, keep input order, drop duplicates."""
+    seen, out = set(), []
+    for t in re.findall(r"\d+", raw):
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+def find_key(obj, key):
+    """Return the first value for `key` anywhere in a nested dict/list."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            found = find_key(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = find_key(v, key)
+            if found is not None:
+                return found
+    return None
+
+
+def get_parent_tcin(product: dict):
+    direct = find_key(product, "parent_tcin")
+    if direct:
+        return direct
+    parent = find_key(product, "parent")
+    if isinstance(parent, dict):
+        return parent.get("tcin")
+    return None
+
+
+# ==========================================================================
+# SITEMAP MODE
+# ==========================================================================
+
+def fetch_xml(session: requests.Session, url: str) -> bytes | None:
+    """Download a sitemap file; transparently gunzip .gz content."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = session.get(url, headers=PAGE_HEADERS, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            print(f"   request error on {url}: {type(e).__name__}")
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code != 200:
+            print(f"   HTTP {r.status_code} on {url}")
+            if r.status_code in (429,) or r.status_code >= 500:
+                time.sleep(2 ** attempt + random.random())
+                continue
+            return None
+        body = r.content
+        if body[:2] == b"\x1f\x8b":          # gzip magic bytes
+            try:
+                body = gzip.decompress(body)
+            except OSError:
+                print(f"   could not decompress {url}")
+                return None
+        return body
+    return None
+
+
+def xml_locs(body: bytes) -> list[str]:
+    """Return every <loc> value in a sitemap or sitemap index."""
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        # Fallback for malformed XML.
+        return re.findall(r"<loc>\s*(.*?)\s*</loc>", body.decode("utf-8", "replace"))
+    return [el.text.strip() for el in root.iter() if el.tag.endswith("loc") and el.text]
+
+
+def build_sitemap_index(tcins: list[str]) -> dict[str, str]:
+    """Build {tcin: url} from Target's product sitemap, with disk caching."""
+    if not SITEMAP_REBUILD and os.path.exists(SITEMAP_INDEX_FILE):
+        with open(SITEMAP_INDEX_FILE, encoding="utf-8") as f:
+            cached = json.load(f)
+        print(f"Loaded cached sitemap index: {len(cached):,} entries.")
+        return cached
+
+    wanted = set(tcins) if SITEMAP_FILTER_TO_INPUT else None
+    session = new_session()
+    index: dict[str, str] = {}
+
+    print(f"Downloading sitemap index: {SITEMAP_INDEX_URL}")
+    root_body = fetch_xml(session, SITEMAP_INDEX_URL)
+    if root_body is None:
+        print("Could not download the sitemap index.")
+        return index
+
+    queue = xml_locs(root_body)
+    print(f"{len(queue):,} sitemap files listed.")
+    files_done = 0
+
+    while queue and files_done < SITEMAP_MAX_FILES:
+        url = queue.pop(0)
+        body = fetch_xml(session, url)
+        files_done += 1
+        if body is None:
+            continue
+
+        locs = xml_locs(body)
+        # A nested index lists more sitemap files rather than product URLs.
+        if b"<sitemapindex" in body[:500]:
+            queue.extend(locs)
+            continue
+
+        for loc in locs:
+            m = TCIN_URL_RE.search(loc)
+            if not m:
+                continue
+            tcin = m.group(1)
+            if wanted is None or tcin in wanted:
+                index.setdefault(tcin, loc)
+
+        found = len(index) if wanted is None else len(wanted & index.keys())
+        print(f"   [{files_done}] {url.rsplit('/', 1)[-1]}  "
+              f"{'indexed' if wanted is None else 'matched'}: {found:,}")
+
+        if wanted is not None and wanted <= index.keys():
+            print("All input TCINs found; stopping early.")
+            break
+
+        time.sleep(random.uniform(0.2, 0.6))
+
+    with open(SITEMAP_INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump(index, f)
+    print(f"Sitemap index saved to {SITEMAP_INDEX_FILE} ({len(index):,} entries).")
+    return index
+
+
+def sitemap_lookup(tcins: list[str]) -> dict[str, dict]:
+    index = build_sitemap_index(tcins)
+    results = {}
+    for t in tcins:
+        url = index.get(t)
+        if url:
+            results[t] = {"tcin": t, "status": "LIVE", "url": url, "method": "SITEMAP",
+                          "note": "Found in sitemap_pdp-index"}
+        else:
+            results[t] = {"tcin": t, "status": "NOT_FOUND", "method": "SITEMAP",
+                          "note": "Not in sitemap_pdp-index"}
+    return results
+
+
+# ==========================================================================
+# API MODE (with product-page fallback)
+# ==========================================================================
+
+def refresh_api_key(session: requests.Session) -> str | None:
+    """Read the current RedSky key from the target.com homepage HTML."""
+    try:
+        r = session.get("https://www.target.com/", headers=PAGE_HEADERS, timeout=TIMEOUT)
+        for p in (r'"apiKey"\s*:\s*"([0-9a-f]{40})"',
+                  r'\\"apiKey\\"\s*:\s*\\"([0-9a-f]{40})\\"',
+                  r"[?&]key=([0-9a-f]{40})"):
+            m = re.search(p, r.text)
+            if m:
+                return m.group(1)
+    except requests.RequestException:
+        pass
+    return None
+
+
+def check_api(session: requests.Session, tcin: str, api_key: str) -> dict:
+    params = {"key": api_key, "tcin": tcin, "pricing_store_id": STORE_ID,
+              "store_id": STORE_ID, "has_pricing_store_id": "true"}
+    last_note = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = session.get(PDP_API_URL, params=params, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            last_note = f"API request error: {type(e).__name__}"
+            time.sleep(2 ** attempt)
+            continue
+
+        if r.status_code == 404:
+            return {"status": "NOT_FOUND", "method": "API", "http": 404,
+                    "note": "API returned 404"}
+        if r.status_code in (401, 403):
+            return {"status": "UNKNOWN", "method": "API", "http": r.status_code,
+                    "note": "API key rejected or request blocked", "key_problem": True}
+        if r.status_code == 429 or r.status_code >= 500:
+            last_note = f"API HTTP {r.status_code}"
+            time.sleep(2 ** attempt + random.random())
+            continue
+
+        try:
+            data = r.json()
+        except ValueError:
+            last_note = f"API HTTP {r.status_code}, non-JSON response"
+            time.sleep(2 ** attempt)
+            continue
+
+        product = (data.get("data") or {}).get("product")
+        errors = data.get("errors") or []
+        err_text = " | ".join(str(e.get("message", e)) if isinstance(e, dict) else str(e)
+                              for e in errors if e)
+
+        if product:
+            title = find_key(product, "title")
+            if title:
+                return {
+                    "status": "LIVE", "method": "API", "http": r.status_code,
+                    "title": title,
+                    # buy_url is Target's canonical PDP URL. If it is missing,
+                    # the url is resolved from the page in check_tcin().
+                    "url": find_key(product, "buy_url"),
+                    "price": find_key(product, "formatted_current_price"),
+                    "relationship_type": find_key(product, "relationship_type_code"),
+                    "parent_tcin": get_parent_tcin(product),
+                    "out_of_stock_all_stores": find_key(product, "is_out_of_stock_in_all_store_locations"),
+                    "note": err_text,
+                }
+            last_note = "API product record had no title"
+            break
+
+        if errors and re.search(r"no product found|not found", err_text, re.I):
+            return {"status": "NOT_FOUND", "method": "API", "http": r.status_code,
+                    "note": err_text[:300]}
+
+        last_note = f"API HTTP {r.status_code}, no product. {err_text[:200]}"
+        break
+
+    return {"status": "UNKNOWN", "method": "API", "note": last_note}
+
+
+def check_page(session: requests.Session, tcin: str) -> dict:
+    """
+    Fallback: request the product page.
+
+    Lesson from the HD script: the probe URL /p/-/A-<TCIN> contains the TCIN
+    itself, so "final URL contains the TCIN" proves nothing when the site does
+    not redirect. Here the TCIN must appear in the page's own canonical link
+    (or og:url), which Target only renders for a real product page.
+    """
+    url = PDP_PAGE_URL.format(tcin=tcin)
+    note = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = session.get(url, headers=PAGE_HEADERS, timeout=TIMEOUT, allow_redirects=True)
+        except requests.RequestException as e:
+            note = f"Page request error: {type(e).__name__}"
+            time.sleep(2 ** attempt)
+            continue
+
+        # Status checks come before any URL matching.
+        if r.status_code in (404, 410):
+            return {"status": "NOT_FOUND", "method": "PAGE", "http": r.status_code,
+                    "note": f"PDP returned {r.status_code}"}
+        if r.status_code in (403, 429) or r.status_code >= 500:
+            note = f"Page HTTP {r.status_code}"
+            time.sleep(2 ** attempt + random.random())
+            continue
+        if r.status_code != 200:
+            return {"status": "UNKNOWN", "method": "PAGE", "http": r.status_code,
+                    "note": f"Page HTTP {r.status_code}"}
+
+        html = r.text
+        canon = (re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)', html, re.I)
+                 or re.search(r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)', html, re.I))
+        canon_url = canon.group(1) if canon else ""
+        m = TCIN_URL_RE.search(canon_url)
+
+        title_m = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
+        title = re.sub(r"\s*:\s*Target\s*$", "", title_m.group(1).strip()) if title_m else None
+
+        if m and m.group(1) == tcin and "/p/-/" not in canon_url:
+            return {"status": "LIVE", "method": "PAGE", "http": 200,
+                    "title": title, "url": canon_url}
+        if m and m.group(1) != tcin:
+            return {"status": "LIVE", "method": "PAGE", "http": 200, "title": title,
+                    "url": canon_url, "parent_tcin": m.group(1),
+                    "note": "Page canonicalizes to a different TCIN (likely the variation parent)"}
+        return {"status": "NOT_FOUND", "method": "PAGE", "http": 200, "url": r.url,
+                "note": f"No product canonical URL on page. Title: {title}"}
+
+    return {"status": "UNKNOWN", "method": "PAGE", "note": note}
+
+
+def check_tcin(tcin: str, api_key: str) -> dict:
+    session = new_session()
+    time.sleep(random.uniform(*DELAY_RANGE))
+    result = check_api(session, tcin, api_key)
+    if result["status"] == "UNKNOWN":
+        page_result = check_page(session, tcin)
+        if page_result["status"] != "UNKNOWN":
+            page_result["note"] = (f"API inconclusive ({result.get('note', '')}); "
+                                   + page_result.get("note", "")).strip("; ")
+            result = page_result
+        else:
+            result["note"] = f"{result.get('note', '')} | {page_result.get('note', '')}"
+    # A LIVE item must leave with a real URL. If the API did not supply one,
+    # read the canonical URL from the product page.
+    if result["status"] == "LIVE" and not result.get("url"):
+        page_result = check_page(session, tcin)
+        if page_result.get("status") == "LIVE" and page_result.get("url"):
+            result["url"] = page_result["url"]
+        else:
+            result["note"] = (result.get("note", "") + " | URL not supplied by API "
+                              "and could not be read from the page").strip(" |")
+    result.pop("key_problem", None)
+    result["tcin"] = tcin
+    return result
+
+
+def api_lookup(tcins: list[str]) -> dict[str, dict]:
+    if not tcins:
+        return {}
+    api_key = API_KEY
+    probe = check_api(new_session(), tcins[0], api_key)
+    if probe.get("key_problem"):
+        print("Hard-coded API key rejected. Reading the current key from target.com ...")
+        fresh = refresh_api_key(new_session())
+        if fresh:
+            api_key = fresh
+            print(f"Using refreshed key: {api_key}")
+        else:
+            print("Could not refresh the key. Page fallback will be used.")
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(check_tcin, t, api_key): t for t in tcins}
+        for i, fut in enumerate(as_completed(futures), 1):
+            t = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = {"tcin": t, "status": "UNKNOWN", "note": f"Unhandled: {e!r}"}
+            results[t] = res
+            print(f"   [{i}/{len(tcins)}] {t}: {res['status']}  {res.get('url') or ''}")
+    return results
+
+
+# ==========================================================================
+# MAIN
+# ==========================================================================
+
+def main():
+    tcins = parse_tcins(TCINS_RAW)
+    print(f"{len(tcins)} unique TCINs. MODE = {MODE!r}\n")
+
+    if MODE == "sitemap":
+        results = sitemap_lookup(tcins)
+    elif MODE == "api":
+        results = api_lookup(tcins)
+    elif MODE == "combined":
+        results = sitemap_lookup(tcins)
+        misses = [t for t in tcins if results[t]["status"] != "LIVE"]
+        print(f"\nSitemap: {len(tcins) - len(misses)} LIVE, {len(misses)} not in sitemap.")
+        if misses:
+            print(f"Checking the {len(misses)} sitemap misses with the API ...")
+            results.update(api_lookup(misses))
+    else:
+        raise ValueError('MODE must be "sitemap", "api", or "combined".')
+
+    # In combined mode, an API row with no URL can borrow the sitemap URL.
+    if MODE == "combined" and os.path.exists(SITEMAP_INDEX_FILE):
+        with open(SITEMAP_INDEX_FILE, encoding="utf-8") as f:
+            sm = json.load(f)
+        for t in tcins:
+            if results[t]["status"] == "LIVE" and not results[t].get("url") and sm.get(t):
+                results[t]["url"] = sm[t]
+
+    df = build_dataframe(tcins, results)
+    xlsx_path = export_to_excel(df)
+
+    missing_url = df.loc[(df["status"] == "LIVE") & (df["url"] == ""), "tcin"].tolist()
+    if missing_url:
+        print(f"\n{len(missing_url)} LIVE TCIN(s) without a URL: {', '.join(missing_url)}")
+
+    print("\nSummary")
+    print(df.groupby(["status", "method"], dropna=False).size().to_string())
+
+    unknown = df.loc[df["status"] == "UNKNOWN", "tcin"].tolist()
+    if unknown:
+        print(f"\n{len(unknown)} TCIN(s) UNKNOWN. Re-run with MODE = 'api' or check by hand:")
+        print(", ".join(unknown))
+
+    print(f"\nExcel file saved:\n{xlsx_path}")
+    if OPEN_EXCEL_WHEN_DONE:
+        open_file(xlsx_path)
+
+
+# ==========================================================================
+# EXCEL EXPORT
+# ==========================================================================
+
+COLUMNS = ["tcin", "status", "url", "title", "price", "relationship_type",
+           "parent_tcin", "out_of_stock_all_stores", "method", "http", "note"]
+
+HEADER_LABELS = {
+    "tcin": "TCIN", "status": "Status", "url": "URL", "title": "Title",
+    "price": "Price", "relationship_type": "Relationship Type",
+    "parent_tcin": "Parent TCIN", "out_of_stock_all_stores": "Out of Stock (All Stores)",
+    "method": "Method", "http": "HTTP", "note": "Note",
+}
+
+COLUMN_WIDTHS = {
+    "tcin": 12, "status": 12, "url": 80, "title": 60, "price": 10,
+    "relationship_type": 18, "parent_tcin": 13, "out_of_stock_all_stores": 14,
+    "method": 10, "http": 7, "note": 60,
+}
+
+STATUS_FILL = {          # light green / light red / light amber
+    "LIVE": "C6EFCE",
+    "NOT_FOUND": "FFC7CE",
+    "UNKNOWN": "FFEB9C",
+}
+
+
+def build_dataframe(tcins: list[str], results: dict[str, dict]) -> pd.DataFrame:
+    """One row per input TCIN, in input order, with a fixed column set."""
+    rows = [results.get(t, {"tcin": t, "status": "UNKNOWN", "note": "Not checked"})
+            for t in tcins]
+    df = pd.DataFrame(rows).reindex(columns=COLUMNS)
+    df["tcin"] = df["tcin"].astype(str)
+    df["url"] = df["url"].fillna("")
+    df["note"] = df["note"].fillna("")
+    return df
+
+
+def output_path() -> str:
+    """Build the output file path. Defaults to the folder this script is in."""
+    folder = OUTPUT_FOLDER or os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(folder, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(folder, f"{OUTPUT_FILE_PREFIX}_{stamp}.xlsx")
+
+
+def export_to_excel(df: pd.DataFrame) -> str:
+    """
+    Write the results workbook:
+      Results  one row per TCIN; clickable URLs; status color-coded;
+               header frozen; filters on every column.
+      Summary  counts by status and by status + method.
+    Returns the absolute path of the saved file.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    path = output_path()
+    out = df.rename(columns=HEADER_LABELS)
+
+    summary_status = (df["status"].value_counts()
+                      .reindex(["LIVE", "NOT_FOUND", "UNKNOWN"], fill_value=0)
+                      .rename_axis("Status").reset_index(name="Count"))
+    summary_detail = (df.groupby(["status", "method"], dropna=False).size()
+                      .reset_index(name="Count")
+                      .rename(columns={"status": "Status", "method": "Method"}))
+
+    def write(p: str):
+        with pd.ExcelWriter(p, engine="openpyxl") as writer:
+            out.to_excel(writer, index=False, sheet_name="Results")
+            summary_status.to_excel(writer, index=False, sheet_name="Summary", startrow=0)
+            summary_detail.to_excel(writer, index=False, sheet_name="Summary",
+                                    startrow=len(summary_status) + 3)
+
+            # ---- Results sheet formatting ----
+            ws = writer.sheets["Results"]
+            header_font = Font(bold=True, color="FFFFFF")
+            header_fill = PatternFill("solid", fgColor="CC0000")   # Target red
+            for cell in ws[1]:
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+            for i, col in enumerate(COLUMNS, start=1):
+                ws.column_dimensions[get_column_letter(i)].width = COLUMN_WIDTHS[col]
+
+            url_idx = COLUMNS.index("url") + 1
+            status_idx = COLUMNS.index("status") + 1
+            for r in range(2, len(df) + 2):
+                # TCIN as text so Excel does not convert it to a number.
+                ws.cell(row=r, column=1).number_format = "@"
+
+                url_cell = ws.cell(row=r, column=url_idx)
+                if url_cell.value:
+                    url_cell.hyperlink = url_cell.value
+                    url_cell.style = "Hyperlink"
+
+                status_cell = ws.cell(row=r, column=status_idx)
+                color = STATUS_FILL.get(status_cell.value)
+                if color:
+                    status_cell.fill = PatternFill("solid", fgColor=color)
+
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+
+            # ---- Summary sheet formatting ----
+            ss = writer.sheets["Summary"]
+            ss.column_dimensions["A"].width = 14
+            ss.column_dimensions["B"].width = 12
+            ss.column_dimensions["C"].width = 10
+            for row in (1, len(summary_status) + 4):
+                for cell in ss[row]:
+                    if cell.value is not None:
+                        cell.font = Font(bold=True)
+
+    try:
+        write(path)
+    except PermissionError:
+        # Usually means a file with this name is open in Excel.
+        alt = path.replace(".xlsx", "_1.xlsx")
+        print(f"Could not write {path} (is it open in Excel?). Saving as {alt}")
+        write(alt)
+        path = alt
+    return os.path.abspath(path)
+
+
+def open_file(path: str):
+    """Open the workbook in the default app (Excel on Windows/Mac)."""
+    try:
+        if os.name == "nt":
+            os.startfile(path)                       # Windows
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=False)
+        else:
+            subprocess.run(["xdg-open", path], check=False)
+    except Exception as e:
+        print(f"Could not open the file automatically: {e}")
+
+
+if __name__ == "__main__":
+    main()
